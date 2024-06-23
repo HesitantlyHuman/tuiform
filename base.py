@@ -321,7 +321,6 @@ class Stack(TUIObject):
     async def frame(self, draw_frame: DrawFrame) -> None:
         self.draw_frame = draw_frame
         subframes = self.draw_frame.split(self.splits, self.orientation)
-        print(subframes)
         for i, element in enumerate(self.elements):
             await element.frame(subframes[i])
             if subframes[i] is not None:
@@ -402,12 +401,10 @@ class Panel:
 
         # Calculate the bounds for the footer
         if self.footer is not None:
-            bottom_bound = bottom_bound - (
-                self.footer_height + 1 + 2 * self.vertical_padding
-            )
+            footer_top = (bottom_bound - self.footer_height) + 1
             footer_frame = inner_frame.subframe(
                 (
-                    ScreenCoord(0, bottom_bound),
+                    ScreenCoord(0, footer_top),
                     ScreenCoord(
                         inner_frame.width - 1,
                         inner_frame.height - 1,
@@ -421,15 +418,13 @@ class Panel:
             if footer_frame is not None:
                 await self.footer.frame(footer_frame)
                 self.footer_is_drawable = True
+                bottom_bound = footer_top - (2 + 2 * self.vertical_padding)
 
         # Calculate the bounds for the content
         content_frame = inner_frame.subframe(
             (
                 ScreenCoord(0, top_bound),
-                ScreenCoord(
-                    inner_frame.width - 1,
-                    bottom_bound,
-                ),
+                ScreenCoord(inner_frame.width - 1, bottom_bound),
             )
         )
         if content_frame is not None:
@@ -458,6 +453,14 @@ class Panel:
             await self.header.draw()
 
         if self.footer is not None and self.footer_is_drawable:
+            separator = "─" * (self.draw_frame.width - 2)
+            footer_separator_height = self.draw_frame.height - (2 + self.footer_height)
+            self.draw_frame.draw(1, footer_separator_height, separator)
+            self.draw_frame.draw(0, footer_separator_height, "├")
+            self.draw_frame.draw(
+                self.draw_frame.width - 1, footer_separator_height, "┤"
+            )
+
             await self.footer.draw()
 
         if self.content_is_drawable:
@@ -704,13 +707,6 @@ class Text(TUIObject):
 if __name__ == "__main__":
     import asyncio
 
-    # text_block = Text(
-    #     "Here is some text¶ that we would like to have wrap very nicely\nand not exceed our cute little text box area."
-    # )
-    # draw_frame = DrawFrame(None, (ScreenCoord(0, 3), ScreenCoord(70, 7)))
-    # asyncio.run(text_block.frame(draw_frame))
-    # asdf
-
     # button_one = Button(None, "Button One")
     # button_one.bound_function = button_one.select
     # button_two = Button(None, "Button Two")
@@ -722,11 +718,17 @@ if __name__ == "__main__":
     #     [button_one, button_two, button_three],
     #     Orientation.HORIZONTAL,
     #     element_padding=1,
-    #     divider="|",
+    #     divider="│",
     # )
-    # draw_frame = DrawFrame(None, (ScreenCoord(0, 3), ScreenCoord(70, 3)))
 
-    # asyncio.run(button_stack.frame(draw_frame))
+    # text_block = Text(
+    #     "Here is some text¶ that we would like to have wrap very nicely and not exceed our cute little text box area.\nAnd the text, just does not stop. Just goes on and on and on, and there might even be some tremendously exceptionally long words occassionally",
+    #     new_line_character_style=0,
+    # )
+    # button_panel = Panel(text_block, vertical_padding=0, footer=button_stack)
+    # draw_frame = DrawFrame(None, (ScreenCoord(0, 3), ScreenCoord(70, 8)))
+
+    # asyncio.run(button_panel.frame(draw_frame))
     # asdf
 
     # Here is how we will track the mouse realtime
@@ -780,7 +782,7 @@ if __name__ == "__main__":
         "Here is some text¶ that we would like to have wrap very nicely and not exceed our cute little text box area.\nAnd the text, just does not stop. Just goes on and on and on, and there might even be some tremendously exceptionally long words occassionally",
         new_line_character_style=curses.color_pair(0) | curses.A_DIM,
     )
-    button_panel = Panel(text_block, vertical_padding=0)
+    button_panel = Panel(text_block, vertical_padding=0, footer=button_stack)
     draw_frame = DrawFrame(screen, (ScreenCoord(0, 3), ScreenCoord(70, 8)))
 
     async def await_getch(screen: "curses._CursesWindow"):
