@@ -1,10 +1,18 @@
-from typing import Tuple, Callable, Awaitable, Optional, List, Self
+from typing import Tuple, Callable, Awaitable, Optional, List, Self, Sequence
 
 import curses
-import pyperclip
+import clipman
 from enum import Enum
 
 import time
+
+CLIPBOARD_AVAILABLE = False
+
+try:
+    clipman.init()
+    CLIPBOARD_AVAILABLE = True
+except:
+    pass
 
 
 class ScreenCoord:
@@ -24,35 +32,6 @@ class ScreenCoord:
 class Orientation(Enum):
     HORIZONTAL = "horizontal"
     VERTICAL = "vertical"
-
-
-class FocusTree:
-    focusable: bool
-    focused: bool
-    on_focus: Callable[[], Awaitable[None]]
-    children: List["FocusTree"]
-    parent: Optional["FocusTree"]
-
-    async def focus_self(self) -> None:
-        if not self.focusable:
-            raise ValueError("This FocusTree is not focusable")
-
-    async def focus_next() -> None:
-        pass
-
-    async def focus_previous() -> None:
-        pass
-
-    async def clear_focus(self) -> None:
-        for child in self.children:
-            await child.clear_focus()
-
-    @property
-    def child_is_focused(self) -> bool:
-        for child in self.children:
-            if child.focused or child.child_is_focused:
-                return True
-        return False
 
 
 class DrawFrame:
@@ -79,6 +58,27 @@ class DrawFrame:
 
     # TODO: fix this so that overlays are always on top of non-overlays
     def draw(self, x: int, y: int, text: str, style: int = None, overlay: bool = False):
+        if not isinstance(x, int):
+            raise ValueError(
+                f"`DrawFrame.draw` expected `x` to be type `int`, received type {type(x)}."
+            )
+        if not isinstance(y, int):
+            raise ValueError(
+                f"`DrawFrame.draw` expected `y` to be type `int`, received type {type(y)}."
+            )
+        if not isinstance(text, str):
+            raise ValueError(
+                f"`DrawFrame.draw` expected `text` to be type `str`, received type {type(text)}."
+            )
+        if style is not None and not isinstance(style, int):
+            raise ValueError(
+                f"`DrawFrame.draw` expected `style` to be type `int` or value `None`, received type {type(style)}."
+            )
+        if not isinstance(overlay, bool):
+            raise ValueError(
+                f"`DrawFrame.draw` expected `overlay` to be type `bool`, received type {type(text)}."
+            )
+
         if not self.is_drawable:
             return
 
@@ -188,14 +188,14 @@ class DrawFrame:
         Returns:
             List[DrawFrame | None]: The subframes created by the split.
         """
-        if not self.is_drawable:
+        if self.bounds is None:
             if isinstance(splits, int):
-                return [DrawFrame(self.screen, None) for _ in range(splits)]
-            elif isinstance(splits, list):
-                return [DrawFrame(self.screen, None) for _ in splits]
+                return [DrawFrame(self.screen) for _ in range(splits)]
+            elif isinstance(splits, Sequence):
+                return [DrawFrame(self.screen) for _ in splits]
             else:
                 raise ValueError(
-                    f"Expected splits to be an int or a list, instead got {splits}"
+                    f"`DrawFrame.split` expected `splits` type of int or sequence, received type of {type(splits)} instead."
                 )
 
         match orientation:
@@ -214,7 +214,7 @@ class DrawFrame:
                 lengths[idx] += 1
                 leftovers -= 1
                 idx += 1
-        elif isinstance(splits, list):
+        elif isinstance(splits, Sequence):
             # Iterate through the list and calculate the lengths
             # We will keep the Nones for now
             desired_lengths = [None] * len(splits)
@@ -265,7 +265,7 @@ class DrawFrame:
                     remaining_length -= desired_length
         else:
             raise ValueError(
-                f"Expected splits to be an int or a list, instead got {splits}"
+                f"`DrawFrame.split` expected `splits` type of int or sequence, received type of {type(splits)} instead."
             )
 
         # Now, we will create the subframes
@@ -320,6 +320,12 @@ class DrawFrame:
             self.bounds[0].x <= x <= self.bounds[1].x
             and self.bounds[0].y <= y <= self.bounds[1].y
         )
+
+    @classmethod
+    def from_screen(cls, screen: "curses._CursesWindow") -> "DrawFrame":
+        height, width = screen.getmaxyx()
+        bounds = (ScreenCoord(0, 0), ScreenCoord(width - 1, height - 1))
+        return DrawFrame(screen, bounds)
 
     @property
     def width(self) -> Optional[int]:
@@ -746,10 +752,6 @@ class Button(TUIObject):
         return f"Button(label={self.label})"
 
 
-# TODO: Add in a check for the linux xsel or xclip libs and change message to alert user
-# TODO: Add some sort of hover animation
-# TODO: Add a copied to clipboard overlay message (how do we do this within the draw frame framework)
-# TODO: Implement the copying to clipboard
 class CopyableObject(TUIObject):
     COPY_ICON = "⧉"
     MESSAGE_DISPLAY_TIME = 1
@@ -806,9 +808,20 @@ class CopyableObject(TUIObject):
         )
 
         if time.time() < self.copied_timestamp + CopyableObject.MESSAGE_DISPLAY_TIME:
-            self.draw_frame.draw(
-                self.draw_frame.width - 10, -1, "(Copied to clipboard)", overlay=True
-            )
+            if CLIPBOARD_AVAILABLE:
+                self.draw_frame.draw(
+                    self.draw_frame.width - 21,
+                    -1,
+                    "(Copied to clipboard)",
+                    overlay=True,
+                )
+            else:
+                self.draw_frame.draw(
+                    self.draw_frame.width - 76,
+                    -1,
+                    "(Install `xsel` or `xclip` if you want to be able to copy to your clipboard)",
+                    overlay=True,
+                )
 
         await self.object.draw()
 
@@ -850,6 +863,8 @@ class CopyableObject(TUIObject):
         if self.copied:
             self.copied = False
             self.copied_timestamp = time.time()
+            if CLIPBOARD_AVAILABLE:
+                clipman.set(self.text_to_copy)
         await self.object.execute()
 
     def __repr__(self) -> str:
@@ -1055,7 +1070,9 @@ if __name__ == "__main__":
         new_line_character_style=curses.color_pair(0) | curses.A_DIM,
     )
     value_example = DataValue("Active Log", "generate_sums")
-    copyable_text_block = CopyableObject(object=text_block, text_to_copy="HELLO THERE")
+    copyable_text_block = CopyableObject(
+        object=text_block, text_to_copy=text_block.text
+    )
     content_stack = Stack(
         [copyable_text_block, value_example],
         orientation=Orientation.VERTICAL,
