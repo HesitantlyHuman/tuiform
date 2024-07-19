@@ -348,11 +348,14 @@ class DrawFrame:
 
 
 class TUIObject:
-    FOCUSABLE: bool
-    focused: bool
+    IS_INTERACTABLE: bool = False
+
+    _is_focusable: Optional[bool] = None
+    _focused: bool = False  # Whether a child of this object is the active object
+    _active: bool = False  # The currently selected / interactable object
     draw_frame: DrawFrame
-    children: Optional[List["TUIObject"]]
-    parent: Optional["TUIObject"]
+    children: Optional[List["TUIObject"]] = None
+    parent: Optional["TUIObject"] = None
 
     async def frame(self, draw_frame: DrawFrame) -> None:
         """Sets the location for the object to be drawn in the view"""
@@ -371,33 +374,135 @@ class TUIObject:
         """Execute any actions that the object needs to perform"""
         pass
 
-    async def add_children(self) -> None:
-        pass
+    def set_parent(self, parent: "TUIObject") -> None:
+        self.parent = parent
+
+    def unset_parent(self) -> None:
+        self.parent = None
+
+    def add_child(self, child: "TUIObject") -> None:
+        if self.children is None:
+            self.children = []
+
+        self.children.append(child)
+        child.set_parent(self)
+        self._uncache_focusability()
+
+    def remove_child(self, child: "TUIObject") -> None:
+        try:
+            self.children.remove(child)
+        except ValueError:
+            pass
+
+        child.unset_parent()
+
+        if len(self.children) == 0:
+            self.children = None
+
+        self._uncache_focusability()
+
+    def _uncache_focusability(self) -> bool:
+        self._is_focusable = None
+
+        if self.parent is not None:
+            self.parent._uncache_focusability()
+
+    def _calc_focusability(self) -> bool:
+        if self.IS_INTERACTABLE:
+            return True
+
+        if self.children is not None:
+            for child in self.children:
+                if child.is_focusable():
+                    return True
+
+        return False
+
+    def is_focusable(self) -> bool:
+        if self._is_focusable is None:
+            self._is_focusable = self._calc_focusability()
+        return self._is_focusable
+
+    def is_focused(self) -> bool:
+        return self._focused
+
+    def is_active(self) -> bool:
+        return self._active
 
     def focus_next(self) -> None:
-        if self.parent:
-            self.parent.clear_focus()
-        pass
+        if self.children is not None:
+            # Find the currently focused child
+            for idx, child in enumerate(self.children):
+                if child.is_focused():
+                    child.unfocus()
+                    break
+            if idx == len(self.children) - 1:
+                if self.parent is not None:
+                    self.parent.focus_next()
+                else:
+                    self.children[idx].focus()
+            else:
+                self.children[idx + 1].focus()
+        else:
+            if self.parent is not None:
+                self.parent.focus_next()
 
     def focus_prev(self) -> None:
-        # First, before we reset the focus, lets
-        # find what needs to be focused
+        if self.children is not None:
+            # Find the currently focused child
+            for idx, child in enumerate(self.children):
+                if child.is_focused():
+                    child.unfocus()
+                    break
+            if idx == 0:
+                if self.parent is not None:
+                    self.parent.focus_prev()
+                else:
+                    self.children[idx].focus()
+            else:
+                self.children[idx - 1].focus()
+        else:
+            if self.parent is not None:
+                self.parent.focus_prev()
 
-        if self.parent:
-            self.parent.clear_focus()
-        pass
+    def _focus_up(self) -> None:
+        self._focused = True
+        if self.parent is not None:
+            self.parent._focus_up()
 
-    def focus_self(self) -> None:
-        self.clear_focus()
-        if self.FOCUSABLE:
-            self.focused = True
-        elif len(self.children) > 0:
-            self.children[0].focus_self()
+    def focus(self) -> None:
+        self.unfocus()
+        if not self.is_focusable():
+            if self.parent is not None:
+                self.parent.focus_next()
 
-    def clear_focus(self) -> None:
-        self.focused = False
-        for child in self.children:
-            child.clear_focus()
+        if self.parent is not None:
+            self.parent._focus_up()
+
+        if self.children is not None:
+            for child in self.children:
+                if child.is_focusable():
+                    child.focus()
+                    break
+        else:
+            self._active = True
+        self._focused = True
+
+    def _unfocus_down(self) -> None:
+        self._focused = False
+        self._active = False
+        if self.children is not None:
+            for child in self.children:
+                child._unfocus_down()
+
+    def _unfocus_up(self) -> None:
+        if self.parent is not None:
+            self.parent._unfocus_up()
+        else:
+            self._unfocus_down()
+
+    def unfocus(self) -> None:
+        self._unfocus_up()
 
 
 # TODO:
@@ -432,7 +537,6 @@ class Stack(TUIObject):
         divider: str | None = None,
         divider_style: int = 0,
     ) -> None:
-        self.elements = elements
         self.orientation = orientation
         if splits is None:
             self.splits = [None] * len(elements)
@@ -445,63 +549,61 @@ class Stack(TUIObject):
             # Interleave dividers of size 1
             new_elements = []
             new_splits = []
-            for i, (element, split) in enumerate(zip(self.elements, self.splits)):
+            for i, (element, split) in enumerate(zip(elements, self.splits)):
                 new_elements.append(element)
                 new_splits.append(split)
-                if i < len(self.elements) - 1:
+                if i < len(elements) - 1:
                     new_elements.append(Fill(divider, divider_style))
                     new_splits.append(1)
 
-            self.elements = new_elements
+            elements = new_elements
             self.splits = new_splits
 
         if element_padding > 0:
             # Interleave padding
             new_elements = []
             new_splits = []
-            for i, (element, split) in enumerate(zip(self.elements, self.splits)):
+            for i, (element, split) in enumerate(zip(elements, self.splits)):
                 new_elements.append(element)
                 new_splits.append(split)
-                if i < len(self.elements) - 1:
+                if i < len(elements) - 1:
                     new_elements.append(Fill(" ", element_padding_style))
                     new_splits.append(element_padding)
 
-            self.elements = new_elements
+            elements = new_elements
             self.splits = new_splits
 
-        self.drawable = [True for _ in self.elements]
+        for element in elements:
+            self.add_child(element)
 
         super().__init__()
 
     async def frame(self, draw_frame: DrawFrame) -> None:
         self.draw_frame = draw_frame
         subframes = self.draw_frame.split(self.splits, self.orientation)
-        for i, element in enumerate(self.elements):
-            await element.frame(subframes[i])
-            if subframes[i] is not None:
-                self.drawable[i] = True
-            else:
-                self.drawable[i] = False
+        for i, child in enumerate(self.children):
+            await child.frame(subframes[i])
 
     async def draw(self) -> None:
-        for i, element in enumerate(self.elements):
-            if self.drawable[i]:
-                await element.draw()
+        for child in self.children:
+            if child.draw_frame.is_drawable:
+                await child.draw()
 
     async def update(
         self, event_code: int, mouse_x: int, mouse_y: int, mouse_button: int
     ) -> None:
-        for element in self.elements:
-            await element.update(event_code, mouse_x, mouse_y, mouse_button)
+        for child in self.children:
+            await child.update(event_code, mouse_x, mouse_y, mouse_button)
 
     async def execute(self) -> None:
-        for element in self.elements:
-            await element.execute()
+        for child in self.children:
+            await child.execute()
+
+    def __repr__(self) -> str:
+        return f"Stack(elements={self.children}, orientation={self.orientation}, splits={self.splits}, element_padding={self.element_padding}, divider={self.divider})"
 
 
-class Panel:
-    active: bool
-
+class Panel(TUIObject):
     def __init__(
         self,
         content: TUIObject,
@@ -581,27 +683,34 @@ class Panel:
         if not self.draw_frame.is_drawable:
             return
 
+        if self.is_focused():
+            style = curses.color_pair(0)
+        else:
+            style = curses.color_pair(0) | curses.A_DIM
+
         for y in [0, self.draw_frame.height - 1]:
             border = "─" * (self.draw_frame.width - 2)
-            self.draw_frame.draw(1, y, border)
+            self.draw_frame.draw(1, y, border, style)
 
         for x in [0, self.draw_frame.width - 1]:
             for y in range(1, self.draw_frame.height - 1):
-                self.draw_frame.draw(x, y, "│")
+                self.draw_frame.draw(x, y, "│", style)
 
-        self.draw_frame.draw(0, 0, "╭")
-        self.draw_frame.draw(self.draw_frame.width - 1, 0, "╮")
-        self.draw_frame.draw(self.draw_frame.width - 1, self.draw_frame.height - 1, "╯")
-        self.draw_frame.draw(0, self.draw_frame.height - 1, "╰")
+        self.draw_frame.draw(0, 0, "╭", style)
+        self.draw_frame.draw(self.draw_frame.width - 1, 0, "╮", style)
+        self.draw_frame.draw(
+            self.draw_frame.width - 1, self.draw_frame.height - 1, "╯", style
+        )
+        self.draw_frame.draw(0, self.draw_frame.height - 1, "╰", style)
 
         if self.header is not None:
             if self.header.draw_frame.is_drawable:
                 separator = "─" * (self.draw_frame.width - 2)
                 header_separator_height = 1 + self.header_height
-                self.draw_frame.draw(1, header_separator_height, separator)
-                self.draw_frame.draw(0, header_separator_height, "├")
+                self.draw_frame.draw(1, header_separator_height, separator, style)
+                self.draw_frame.draw(0, header_separator_height, "├", style)
                 self.draw_frame.draw(
-                    self.draw_frame.width - 1, header_separator_height, "┤"
+                    self.draw_frame.width - 1, header_separator_height, "┤", style
                 )
 
             await self.header.draw()
@@ -612,10 +721,10 @@ class Panel:
                 footer_separator_height = self.draw_frame.height - (
                     2 + self.footer_height
                 )
-                self.draw_frame.draw(1, footer_separator_height, separator)
-                self.draw_frame.draw(0, footer_separator_height, "├")
+                self.draw_frame.draw(1, footer_separator_height, separator, style)
+                self.draw_frame.draw(0, footer_separator_height, "├", style)
                 self.draw_frame.draw(
-                    self.draw_frame.width - 1, footer_separator_height, "┤"
+                    self.draw_frame.width - 1, footer_separator_height, "┤", style
                 )
 
             await self.footer.draw()
@@ -645,6 +754,8 @@ class Panel:
 
 # Only handles single-line text
 class Button(TUIObject):
+    IS_INTERACTABLE = True
+
     hover: bool
     selected: bool
     clicked: bool
@@ -654,8 +765,9 @@ class Button(TUIObject):
         bound_function: Callable[[], Awaitable[None]],
         label: str,
     ):
+        if "\n" in label:
+            raise ValueError("`Button` does not support multiline labels.")
         self.hover = False
-        self.selected = False
         self.clicked = False
         self.label = label
         self.bound_function = bound_function
@@ -665,7 +777,7 @@ class Button(TUIObject):
         style = None
         if self.clicked:
             style = curses.color_pair(1) | curses.A_REVERSE | curses.A_BOLD
-        elif self.selected or self.hover:
+        elif self.is_active() or self.hover:
             style = (
                 curses.color_pair(1) | curses.A_BOLD | curses.A_REVERSE | curses.A_BOLD
             )
@@ -734,11 +846,14 @@ class Button(TUIObject):
                     self.clicked = True
             else:
                 self.hover = False
-        elif event_code == curses.KEY_ENTER and (self.hover or self.selected):
+        elif event_code == curses.KEY_ENTER and (self.hover or self.is_active()):
             self.clicked = True
-        elif event_code == 27 and (self.selected or self.clicked):
+        elif event_code == 27 and (self.is_active() or self.clicked):
             self.clicked = False
-            self.selected = False
+        elif event_code in [curses.KEY_RIGHT, curses.KEY_DOWN] and self.is_active():
+            self.focus_next()
+        elif event_code in [curses.KEY_LEFT, curses.KEY_UP] and self.is_active():
+            self.focus_prev()
 
     async def execute(self) -> None:
         if self.clicked:
@@ -746,13 +861,15 @@ class Button(TUIObject):
             self.clicked = False
 
     async def select(self) -> None:
-        self.selected = True
+        self.focus()
 
     def __repr__(self) -> str:
         return f"Button(label={self.label})"
 
 
 class CopyableObject(TUIObject):
+    IS_INTERACTABLE = True
+
     COPY_ICON = "⧉"
     MESSAGE_DISPLAY_TIME = 1
 
@@ -808,6 +925,7 @@ class CopyableObject(TUIObject):
         )
 
         if time.time() < self.copied_timestamp + CopyableObject.MESSAGE_DISPLAY_TIME:
+            # TODO: query the size of the screen so that we can push this overlay message around to always show up
             if CLIPBOARD_AVAILABLE:
                 self.draw_frame.draw(
                     self.draw_frame.width - 21,
@@ -1084,6 +1202,7 @@ if __name__ == "__main__":
         footer=bottom_button_stack,
         header=button_four,
     )
+    button_panel.focus()
 
     async def await_getch(screen: "curses._CursesWindow"):
         while True:
