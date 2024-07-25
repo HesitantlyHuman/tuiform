@@ -34,8 +34,6 @@ def soft_hyphenate_text(text: str) -> str:
     return output
 
 
-# TODO: Update this to allow for breaking words if necessary (with a large penalty, of course)
-# TODO: Maybe do this by creating a secondary function which automatically adds soft hyphens
 def smart_wrap_text(
     text: str,
     target_width: int = 76,  # maximum length of a wrapped line
@@ -159,6 +157,10 @@ def smart_wrap_text(
 
 
 def cut_line_with_ellipse(line: str, width: int) -> str:
+    if width == 0:
+        return ""
+    elif width == 1:
+        return "…"
     cut_line = line[:width]
     for idx_from_end in range(len(cut_line) - 2, -1, -1):
         if not line[idx_from_end].isspace():

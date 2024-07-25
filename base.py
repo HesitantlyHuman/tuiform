@@ -1,8 +1,14 @@
-from typing import Tuple, Callable, Awaitable, Optional, List, Self, Sequence
+from typing import Tuple, Callable, Awaitable, Optional, List, Self, Sequence, Any
 
 import curses
 import clipman
 from enum import Enum
+
+from autograder.logging.tui.utils.wrap import (
+    smart_wrap_text,
+    right_pad_line,
+    cut_line_with_ellipse,
+)
 
 import time
 
@@ -13,6 +19,9 @@ try:
     CLIPBOARD_AVAILABLE = True
 except:
     pass
+
+# TODO: rename TUIObject to TUIElement, since I'm calling them elements everywhere else
+# TODO: should going back focus the first element anyways?
 
 
 class ScreenCoord:
@@ -32,6 +41,56 @@ class ScreenCoord:
 class Orientation(Enum):
     HORIZONTAL = "horizontal"
     VERTICAL = "vertical"
+
+
+_focused_elements = []
+_active_element = None
+
+
+# Maybe create some sort of queue for updating the focus that is always ran during the execute step?
+class NavigationInput(Enum):
+    UP = "up"
+    DOWN = "down"
+    LEFT = "left"
+    RIGHT = "right"
+    NEXT = "next"
+    PREV = "prev"
+    FIRST = "first"
+    LAST = "last"
+    INTERACT = "interact"
+    EXIT = "exit"
+    QUIT = "quit"
+    NONE = "none"
+
+    @classmethod
+    def from_key_code(cls, key_code: int) -> "NavigationInput":
+        match key_code:
+            case curses.KEY_MOUSE:
+                return NavigationInput.NONE
+            case curses.KEY_UP | 119:
+                return NavigationInput.UP
+            case curses.KEY_DOWN | 115:
+                return NavigationInput.DOWN
+            case curses.KEY_RIGHT | 100:
+                return NavigationInput.RIGHT
+            case curses.KEY_LEFT | 97:
+                return NavigationInput.LEFT
+            case 9:
+                return NavigationInput.NEXT
+            case 353:
+                return NavigationInput.PREV
+            case 337:
+                return NavigationInput.FIRST
+            case 336:
+                return NavigationInput.LAST
+            case 10:
+                return NavigationInput.INTERACT
+            case 27:
+                return NavigationInput.EXIT
+            case 17:
+                return NavigationInput.QUIT
+            case _:
+                return NavigationInput.NONE
 
 
 class DrawFrame:
@@ -165,7 +224,7 @@ class DrawFrame:
 
     def split(
         self, splits: int | List[int | float | None], orientation: Orientation
-    ) -> List[Self | None]:
+    ) -> List["DrawFrame"]:
         """
         Splits the frame into N subframes based on the orientation and the splits provided.
 
@@ -275,7 +334,7 @@ class DrawFrame:
                 x = self.bounds[0].x
                 for length in lengths:
                     if length is None:
-                        subframes.append(None)
+                        subframes.append(DrawFrame(self.screen, None))
                     else:
                         subframes.append(
                             DrawFrame(
@@ -350,159 +409,194 @@ class DrawFrame:
 class TUIObject:
     IS_INTERACTABLE: bool = False
 
-    _is_focusable: Optional[bool] = None
-    _focused: bool = False  # Whether a child of this object is the active object
-    _active: bool = False  # The currently selected / interactable object
     draw_frame: DrawFrame
     children: Optional[List["TUIObject"]] = None
     parent: Optional["TUIObject"] = None
+
+    _is_focusable = None
+    _focusable_children = None
+
+    def __init__(self) -> None:
+        self.draw_frame = DrawFrame(None)
 
     async def frame(self, draw_frame: DrawFrame) -> None:
         """Sets the location for the object to be drawn in the view"""
         self.draw_frame = draw_frame
 
+    async def navigation_update(self, navigation_input: NavigationInput) -> None:
+        """Is called on the active element when navigation input is received."""
+        if navigation_input is NavigationInput.NONE:
+            return
+
+        if self.parent is not None:
+            await self.parent.navigation_update(navigation_input)
+
     async def update(
         self, event_code: int, mouse_x: int, mouse_y: int, mouse_button: int
     ) -> None:
-        """Updates the object based on the user input"""
+        """Updates the object based on the user input. Prefer to use navigation_update."""
         pass
-
-    async def draw(self) -> None:
-        raise NotImplementedError("draw method must be implemented")
 
     async def execute(self) -> None:
         """Execute any actions that the object needs to perform"""
         pass
 
-    def set_parent(self, parent: "TUIObject") -> None:
-        self.parent = parent
-
-    def unset_parent(self) -> None:
-        self.parent = None
+    async def draw(self) -> None:
+        """Draw the object to the screen"""
+        raise NotImplementedError("`TUIObject`s must implement a draw method")
 
     def add_child(self, child: "TUIObject") -> None:
         if self.children is None:
             self.children = []
 
+        if child in self.children:
+            raise ValueError(
+                f"`TUIObject` received a child which is already a child of this object."
+            )
+
         self.children.append(child)
-        child.set_parent(self)
-        self._uncache_focusability()
+        child.parent = self
+
+        if child.is_focusable:
+            self._is_focusable = True
 
     def remove_child(self, child: "TUIObject") -> None:
         try:
             self.children.remove(child)
+            self._is_focusable = None
         except ValueError:
             pass
 
-        child.unset_parent()
+        child.parent = None
 
         if len(self.children) == 0:
             self.children = None
 
-        self._uncache_focusability()
-
-    def _uncache_focusability(self) -> bool:
-        self._is_focusable = None
-
-        if self.parent is not None:
-            self.parent._uncache_focusability()
-
-    def _calc_focusability(self) -> bool:
-        if self.IS_INTERACTABLE:
-            return True
-
-        if self.children is not None:
-            for child in self.children:
-                if child.is_focusable():
-                    return True
-
-        return False
-
+    @property
     def is_focusable(self) -> bool:
         if self._is_focusable is None:
-            self._is_focusable = self._calc_focusability()
+            if self.IS_INTERACTABLE and self.draw_frame.is_drawable:
+                self._is_focusable = True
+                return True
+            if self.children is not None:
+                for child in self.children:
+                    if child.is_focusable:
+                        self._is_focusable = True
+                        return True
+            self._is_focusable = False
         return self._is_focusable
 
+    @property
+    def focusable_children(self) -> List["TUIObject"]:
+        if self.children is None:
+            return None
+        if self._focusable_children is None:
+            self._focusable_children = []
+            for child in self.children:
+                if child.is_focusable:
+                    self._focusable_children.append(child)
+        return self._focusable_children
+
     def is_focused(self) -> bool:
-        return self._focused
+        return self in _focused_elements
 
     def is_active(self) -> bool:
-        return self._active
+        return self is _active_element
 
     def focus_next(self) -> None:
-        if self.children is not None:
+        if self.is_focusable and self.children is not None:
             # Find the currently focused child
-            for idx, child in enumerate(self.children):
+            currently_focused_child_index = -1
+            for index, child in enumerate(self.children):
                 if child.is_focused():
-                    child.unfocus()
+                    currently_focused_child_index = index
                     break
-            if idx == len(self.children) - 1:
-                if self.parent is not None:
+
+            # Find the next focusable child
+            next_focusable_child = None
+            for child_index in range(
+                currently_focused_child_index + 1, len(self.children)
+            ):
+                child = self.children[child_index]
+                if child.is_focusable:
+                    next_focusable_child = child
+                    break
+
+            if next_focusable_child is None:
+                if not self.parent is None:
                     self.parent.focus_next()
-                else:
-                    self.children[idx].focus()
             else:
-                self.children[idx + 1].focus()
-        else:
-            if self.parent is not None:
-                self.parent.focus_next()
+                child.focus(last=False)
+        elif self.parent is not None:
+            self.parent.focus_next()
 
     def focus_prev(self) -> None:
-        if self.children is not None:
+        if self.is_focusable and self.children is not None:
             # Find the currently focused child
-            for idx, child in enumerate(self.children):
+            currently_focused_child_index = len(self.children)
+            for index, child in enumerate(self.children):
                 if child.is_focused():
-                    child.unfocus()
+                    currently_focused_child_index = index
                     break
-            if idx == 0:
-                if self.parent is not None:
+
+            # Find the next focusable child
+            next_focusable_child = None
+            for child_index in range(currently_focused_child_index - 1, -1, -1):
+                child = self.children[child_index]
+                if child.is_focusable:
+                    next_focusable_child = child
+                    break
+
+            if next_focusable_child is None:
+                if not self.parent is None:
                     self.parent.focus_prev()
-                else:
-                    self.children[idx].focus()
             else:
-                self.children[idx - 1].focus()
-        else:
-            if self.parent is not None:
-                self.parent.focus_prev()
+                child.focus(last=True)
+        elif self.parent is not None:
+            self.parent.focus_prev()
 
-    def _focus_up(self) -> None:
-        self._focused = True
-        if self.parent is not None:
-            self.parent._focus_up()
-
-    def focus(self) -> None:
-        self.unfocus()
-        if not self.is_focusable():
+    def focus(self, last: bool = False) -> None:
+        if not self.is_focusable:
             if self.parent is not None:
                 self.parent.focus_next()
 
-        if self.parent is not None:
-            self.parent._focus_up()
+        if self.children is not None and len(self.children) > 0:
+            if last:
+                iterator = range(len(self.children) - 1, -1, -1)
+            else:
+                iterator = range(len(self.children))
+            for child_index in iterator:
+                child = self.children[child_index]
+                if child.is_focusable:
+                    return child.focus(last=last)
 
-        if self.children is not None:
-            for child in self.children:
-                if child.is_focusable():
-                    child.focus()
-                    break
-        else:
-            self._active = True
-        self._focused = True
+        _focused_elements.clear()
+        parent = self.parent
+        while parent is not None:
+            if parent in _focused_elements:
+                break
+            _focused_elements.append(parent)
+            parent = parent.parent
 
-    def _unfocus_down(self) -> None:
-        self._focused = False
-        self._active = False
-        if self.children is not None:
-            for child in self.children:
-                child._unfocus_down()
+        global _active_element
+        _active_element = self
+        _focused_elements.append(self)
 
-    def _unfocus_up(self) -> None:
-        if self.parent is not None:
-            self.parent._unfocus_up()
-        else:
-            self._unfocus_down()
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name == "draw_frame":
+            if not self.draw_frame.is_drawable:
+                self._is_focusable = False
+                self._focusable_children = []
+            else:
+                self._is_focusable = None
+                self._focusable_children = None
 
-    def unfocus(self) -> None:
-        self._unfocus_up()
+            parent = self.parent
+            while parent is not None:
+                parent._is_focusable = None
+                parent._focusable_children = None
+                parent = parent.parent
 
 
 # TODO:
@@ -511,9 +605,9 @@ class TUIObject:
 
 class Fill(TUIObject):
     def __init__(self, fill_char: str, style: int) -> None:
+        super().__init__()
         self.fill_char = fill_char
         self.style = style
-        super().__init__()
 
     async def draw(self) -> None:
         for y in range(self.draw_frame.height):
@@ -522,21 +616,21 @@ class Fill(TUIObject):
             )
 
     def __repr__(self) -> str:
-        return f"Fill(fill_char={self.fill_char}, style={self.style})"
+        return f"Fill(fill_char={repr(self.fill_char)}, style={self.style})"
 
 
-# TODO: Stack will delete buttons if the padding is too large
 class Stack(TUIObject):
     def __init__(
         self,
         elements: List[TUIObject],
         orientation: Orientation,
         splits: int | List[int | float | None] | None = None,
-        element_padding: int = 3,
+        element_padding: int = 0,
         element_padding_style: int = 0,
         divider: str | None = None,
         divider_style: int = 0,
     ) -> None:
+        super().__init__()
         self.orientation = orientation
         if splits is None:
             self.splits = [None] * len(elements)
@@ -576,18 +670,71 @@ class Stack(TUIObject):
         for element in elements:
             self.add_child(element)
 
-        super().__init__()
-
     async def frame(self, draw_frame: DrawFrame) -> None:
         self.draw_frame = draw_frame
         subframes = self.draw_frame.split(self.splits, self.orientation)
         for i, child in enumerate(self.children):
             await child.frame(subframes[i])
 
-    async def draw(self) -> None:
-        for child in self.children:
-            if child.draw_frame.is_drawable:
-                await child.draw()
+    async def navigation_update(self, navigation_input: NavigationInput) -> None:
+        if navigation_input is NavigationInput.NONE:
+            return
+
+        if len(self.children) == 0:
+            if self.parent is not None:
+                await self.parent.navigation_update(navigation_input)
+            return
+
+        with open("output.txt", "a") as f:
+            print(
+                f"Stack with orientation {self.orientation} received navigation input {navigation_input}",
+                file=f,
+            )
+
+        match (self.orientation, navigation_input):
+            case (Orientation.HORIZONTAL, NavigationInput.RIGHT) | (
+                Orientation.VERTICAL,
+                NavigationInput.DOWN,
+            ):
+                with open("output.txt", "a") as f:
+                    print(
+                        f"Checking if focus next",
+                        file=f,
+                    )
+                if not self.focusable_children[-1].is_focused():
+                    with open("output.txt", "a") as f:
+                        print(
+                            f"Focusing next",
+                            file=f,
+                        )
+                    self.focus_next()
+                    return
+            case (Orientation.HORIZONTAL, NavigationInput.LEFT) | (
+                Orientation.VERTICAL,
+                NavigationInput.UP,
+            ):
+                if not self.focusable_children[0].is_focused():
+                    self.focus_prev()
+                    return
+            case (_, NavigationInput.FIRST):
+                if not self.focusable_children[0].is_focused():
+                    self.focus(last=False)
+                    return
+            case (_, NavigationInput.LAST):
+                if not self.focusable_children[-1].is_focused():
+                    self.focus(last=True)
+                    return
+            case (_, NavigationInput.NEXT):
+                if self.parent is not None:
+                    self.parent.focus_next()
+                    return
+            case (_, NavigationInput.PREV):
+                if self.parent is not None:
+                    self.parent.focus_prev()
+                    return
+
+        if self.parent is not None:
+            await self.parent.navigation_update(navigation_input)
 
     async def update(
         self, event_code: int, mouse_x: int, mouse_y: int, mouse_button: int
@@ -599,6 +746,11 @@ class Stack(TUIObject):
         for child in self.children:
             await child.execute()
 
+    async def draw(self) -> None:
+        for child in self.children:
+            if child.draw_frame.is_drawable:
+                await child.draw()
+
     def __repr__(self) -> str:
         return f"Stack(elements={self.children}, orientation={self.orientation}, splits={self.splits}, element_padding={self.element_padding}, divider={self.divider})"
 
@@ -607,13 +759,14 @@ class Panel(TUIObject):
     def __init__(
         self,
         content: TUIObject,
-        vertical_padding: int = 1,
+        vertical_padding: int = 0,
         horizontal_padding: int = 1,
         header: Optional[TUIObject] = None,
         header_height: int = 1,
         footer: Optional[TUIObject] = None,
         footer_height: int = 1,
     ):
+        super().__init__()
         self.content = content
         self.vertical_padding = vertical_padding
         self.horizontal_padding = horizontal_padding
@@ -622,6 +775,12 @@ class Panel(TUIObject):
         self.footer = footer
         self.footer_height = footer_height
         self.active = False
+
+        if self.header is not None:
+            self.add_child(self.header)
+        self.add_child(self.content)
+        if self.footer is not None:
+            self.add_child(self.footer)
 
     async def frame(self, draw_frame: DrawFrame) -> None:
         self.draw_frame = draw_frame
@@ -650,7 +809,8 @@ class Panel(TUIObject):
 
         # Calculate the bounds for the footer
         if self.footer is not None:
-            footer_top = (content_bottom - self.footer_height) + 1
+            total_footer_size = 2 * self.vertical_padding + self.footer_height
+            footer_top = (content_bottom - total_footer_size) + 1
             footer_frame = inner_frame.subframe(
                 (
                     ScreenCoord(0, footer_top),
@@ -678,6 +838,38 @@ class Panel(TUIObject):
             self.horizontal_padding, self.vertical_padding
         )
         await self.content.frame(content_frame)
+
+    async def navigation_update(self, navigation_input: NavigationInput) -> None:
+        if navigation_input is NavigationInput.NONE:
+            return
+
+        if len(self.children) == 0:
+            if self.parent is not None:
+                await self.parent.navigation_update(navigation_input)
+            return
+
+        # TODO: figure out a better way for the TUIObjects to query
+        # their focusable children
+        match navigation_input:
+            case NavigationInput.UP:
+                if not self.focusable_children[0].is_focused():
+                    self.focus_prev()
+                    return
+            case NavigationInput.DOWN:
+                if not self.focusable_children[-1].is_focused():
+                    self.focus_next()
+                    return
+            case NavigationInput.FIRST:
+                if not self.focusable_children[0].is_focused():
+                    self.focus(last=False)
+                    return
+            case NavigationInput.LAST:
+                if not self.focusable_children[-1].is_focused():
+                    self.focus(last=True)
+                    return
+
+        if self.parent is not None:
+            await self.parent.navigation_update(navigation_input)
 
     async def draw(self) -> None:
         if not self.draw_frame.is_drawable:
@@ -719,7 +911,7 @@ class Panel(TUIObject):
             if self.footer.draw_frame.is_drawable:
                 separator = "─" * (self.draw_frame.width - 2)
                 footer_separator_height = self.draw_frame.height - (
-                    2 + self.footer_height
+                    2 + self.footer_height + 2 * self.vertical_padding
                 )
                 self.draw_frame.draw(1, footer_separator_height, separator, style)
                 self.draw_frame.draw(0, footer_separator_height, "├", style)
@@ -751,8 +943,11 @@ class Panel(TUIObject):
 
         await self.content.execute()
 
+    def __repr__(self) -> str:
+        return f"Panel(content={self.content}, header={self.header}, footer={self.footer}, horizontal_padding={self.horizontal_padding}, vertical_padding={self.vertical_padding})"
 
-# Only handles single-line text
+
+# TODO: Only handles single-line text, replace text here with the text wrap stuff
 class Button(TUIObject):
     IS_INTERACTABLE = True
 
@@ -765,13 +960,25 @@ class Button(TUIObject):
         bound_function: Callable[[], Awaitable[None]],
         label: str,
     ):
+        super().__init__()
         if "\n" in label:
             raise ValueError("`Button` does not support multiline labels.")
         self.hover = False
         self.clicked = False
         self.label = label
         self.bound_function = bound_function
-        super().__init__()
+
+    async def navigation_update(self, navigation_input: NavigationInput) -> None:
+        if navigation_input is NavigationInput.NONE:
+            return
+
+        match navigation_input:
+            case NavigationInput.INTERACT:
+                self.clicked = True
+                return
+
+        if self.parent is not None:
+            await self.parent.navigation_update(navigation_input)
 
     async def draw(self) -> None:
         style = None
@@ -844,16 +1051,9 @@ class Button(TUIObject):
                     curses.BUTTON1_RELEASED,
                 ]:
                     self.clicked = True
+                    self.focus()
             else:
                 self.hover = False
-        elif event_code == curses.KEY_ENTER and (self.hover or self.is_active()):
-            self.clicked = True
-        elif event_code == 27 and (self.is_active() or self.clicked):
-            self.clicked = False
-        elif event_code in [curses.KEY_RIGHT, curses.KEY_DOWN] and self.is_active():
-            self.focus_next()
-        elif event_code in [curses.KEY_LEFT, curses.KEY_UP] and self.is_active():
-            self.focus_prev()
 
     async def execute(self) -> None:
         if self.clicked:
@@ -864,7 +1064,7 @@ class Button(TUIObject):
         self.focus()
 
     def __repr__(self) -> str:
-        return f"Button(label={self.label})"
+        return f"Button(label={repr(self.label)})"
 
 
 class CopyableObject(TUIObject):
@@ -885,6 +1085,7 @@ class CopyableObject(TUIObject):
         copy_button_style: int = 0,
         copy_button_highlight_style: int = None,
     ):
+        super().__init__()
         self.object = object
         self.text_to_copy = text_to_copy
         self.copy_button_style = copy_button_style
@@ -895,7 +1096,6 @@ class CopyableObject(TUIObject):
         self.selected = False
         self.copied = False
         self.copied_timestamp = 0
-        super().__init__()
 
     async def frame(self, draw_frame: DrawFrame) -> None:
         self.draw_frame = draw_frame
@@ -910,22 +1110,38 @@ class CopyableObject(TUIObject):
         )
         await self.object.frame(wrapped_object_frame)
 
+    async def navigation_update(self, navigation_input: NavigationInput) -> None:
+        if navigation_input is NavigationInput.NONE:
+            return
+
+        match navigation_input:
+            case NavigationInput.INTERACT:
+                self.copied = True
+
+        if self.parent is not None:
+            await self.parent.navigation_update(navigation_input)
+
     async def draw(self) -> None:
+        if self.hovered or self.is_active():
+            style = self.copy_button_highlight_style
+        else:
+            style = self.copy_button_style
+
         if not self.draw_frame.is_drawable:
             return
         self.draw_frame.draw(
             self.draw_frame.width - 1,
             0,
             CopyableObject.COPY_ICON,
-            (
-                self.copy_button_highlight_style
-                if self.hovered
-                else self.copy_button_style
-            ),
+            style,
         )
 
         if time.time() < self.copied_timestamp + CopyableObject.MESSAGE_DISPLAY_TIME:
-            # TODO: query the size of the screen so that we can push this overlay message around to always show up
+            # TODO: query the size of the screen so that we can push this overlay
+            # message around to always show up
+            # TODO: maybe create a late_draw method which is called after the normal
+            # draw, so that we can ensure overlays function correctly
+            # (How do we figure out if that is too much overhead?)
             if CLIPBOARD_AVAILABLE:
                 self.draw_frame.draw(
                     self.draw_frame.width - 21,
@@ -948,6 +1164,7 @@ class CopyableObject(TUIObject):
     ) -> None:
         if not self.draw_frame.is_drawable:
             return
+
         if event_code == curses.KEY_MOUSE:
             if self.draw_frame.contains(mouse_x, mouse_y) and mouse_button in [
                 curses.BUTTON1_PRESSED,
@@ -968,8 +1185,6 @@ class CopyableObject(TUIObject):
             else:
                 self.hovered = False
 
-        else:
-            pass  # TODO: figure out how to check for Ctrl + Shift + C
         await self.object.update(
             event_code=event_code,
             mouse_x=mouse_x,
@@ -986,20 +1201,14 @@ class CopyableObject(TUIObject):
         await self.object.execute()
 
     def __repr__(self) -> str:
-        return f"CopyableText(object={self.object}, text_to_copy={self.text_to_copy}, copy_button_style={self.copy_button_style})"
-
-
-from autograder.logging.tui.utils.text import (
-    smart_wrap_text,
-    right_pad_line,
-    cut_line_with_ellipse,
-)
+        return f"CopyableText(object={self.object}, text_to_copy={repr(self.text_to_copy)}, copy_button_style={self.copy_button_style})"
 
 
 class Text(TUIObject):
     def __init__(
         self, text: str, text_style: int = 0, new_line_character_style: int = 0
     ) -> None:
+        super().__init__()
         self.text = text
         self.lines: List[str] = []
         self.new_line_characters: List[Tuple[int, int]] = []
@@ -1039,7 +1248,7 @@ class Text(TUIObject):
             for character_number, character in enumerate(line):
                 if character == "\uf026":
                     new_line_locations.append((character_number, line_number))
-            line = line.replace("\uf026", " ")
+            line = line.replace("\uf026", "¶")
             line = right_pad_line(line, self.draw_frame.width)
             formatted_lines.append(line)
 
@@ -1060,6 +1269,9 @@ class Text(TUIObject):
         for x, y in self.new_line_characters:
             self.draw_frame.draw(x, y, "¶", self.new_line_character_style)
 
+    def __repr__(self) -> str:
+        return f"Text(text={repr(self.text)}, text_style={self.text_style})"
+
 
 # TODO: fix the value coloring
 class DataValue(TUIObject):
@@ -1067,6 +1279,7 @@ class DataValue(TUIObject):
     value: str
 
     def __init__(self, label: str, value: str) -> None:
+        super().__init__()
         self.label = label + ":"
         self.value = value
         self.label_text_box = Text(
@@ -1094,45 +1307,8 @@ class DataValue(TUIObject):
 # The issue is that the scrollable item needs to know how big it is, based on its internals...
 # the problem for us is that we have designed everything with a top down control scheme
 
-# TODO: How do we do changing selection with the arrow keys
-# Make sure everything is navigable without mouse
-
-# FOCUS HANDLING
-# Clicks should completely override the focus
-# Tabs and Shift + Tabs should change the focus
-# Arrow keys should change focus if the user has reached the end of internal selections / behavior
-# Maybe they should just have some bindable .focus_next() and .focus_prev()
-# Or maybe they should be given an object which they can call those functions on? Focus Chain
-# And the focus chain would be nestable, so if we need to break out it can do that
-
 if __name__ == "__main__":
     import asyncio
-
-    # button_one = Button(None, "Button One")
-    # button_one.bound_function = button_one.select
-    # button_two = Button(None, "Button Two")
-    # button_two.bound_function = button_one.select
-    # button_three = Button(None, "Button Three")
-    # button_three.bound_function = button_three.select
-
-    # button_stack = Stack(
-    #     [button_one, button_two, button_three],
-    #     Orientation.HORIZONTAL,
-    #     element_padding=1,
-    #     divider="│",
-    # )
-
-    # text_block = Text(
-    #     "Here is some text¶ that we would like to have wrap very nicely and not exceed our cute little text box area.\nAnd the text, just does not stop. Just goes on and on and on, and there might even be some tremendously exceptionally long words occassionally",
-    #     new_line_character_style=0,
-    # )
-    # button_panel = Panel(text_block, vertical_padding=0, footer=button_stack)
-    # draw_frame = DrawFrame(None, (ScreenCoord(0, 3), ScreenCoord(70, 8)))
-
-    # asyncio.run(button_panel.frame(draw_frame))
-    # asdf
-
-    # Here is how we will track the mouse realtime
 
     # Set environment variables
     from os import environ
@@ -1145,10 +1321,6 @@ if __name__ == "__main__":
     import curses
 
     screen = curses.initscr()
-    screen.keypad(1)
-    screen.nodelay(1)
-
-    # Now set up our colors
 
     # STYLING (FUCK ME)
     curses.start_color()
@@ -1157,31 +1329,28 @@ if __name__ == "__main__":
     curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
     curses.init_pair(2, curses.COLOR_BLUE, curses.COLOR_BLACK)
 
-    curses.curs_set(0)
-    curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
-    curses.mouseinterval(5)
-    print("\033[?1003h")  # enable mouse tracking with the XTERM API
-    # https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-Mouse-Tracking
-    curses.flushinp()
-    curses.noecho()
-    screen.clear()
-
-    button_one = Button(None, "Button One")
+    button_one = Button(None, "One")
     button_one.bound_function = button_one.select
-    button_two = Button(None, "Button Two")
-    button_two.bound_function = button_one.select
-    button_three = Button(None, "Button Three lol")
-    button_three.bound_function = button_three.select
 
     bottom_button_stack = Stack(
-        [button_one, button_two, button_three],
+        [
+            button_one,
+            Button(None, "Two"),
+            Button(None, "Three"),
+            Button(None, "Four"),
+            Button(None, "Five"),
+            Button(None, "Six"),
+            Button(None, "Seven"),
+            Button(None, "Eight"),
+            Button(None, "Nine"),
+            Button(None, "Ten"),
+        ],
         Orientation.HORIZONTAL,
         element_padding=1,
         divider="│",
     )
 
     button_four = Button(None, "Button Four")
-    button_four.bound_function = button_three.select
 
     text_block = Text(
         "Here is some text¶ that we would like to have wrap very nicely and not exceed our cute little text box area.\nAnd the text, just does not stop. Just goes on and on and on, and there might even be some tremendously exceptionally long words occassionally",
@@ -1194,15 +1363,40 @@ if __name__ == "__main__":
     content_stack = Stack(
         [copyable_text_block, value_example],
         orientation=Orientation.VERTICAL,
-        element_padding=0,
     )
     button_panel = Panel(
         content_stack,
-        vertical_padding=0,
         footer=bottom_button_stack,
         header=button_four,
     )
-    button_panel.focus()
+    other_text_block = Text(
+        "This is some other text that will reside on the right side of the screen. sodfimeslietnsleijtlsidflsiefjseflseijflsiejf sljsielfjsliefjlsiejflsijelfijsliejflsijeflisjelf sleifjlsiejflisjelfijslfdlskvnlsd"
+    )
+    other_text_block_panel = Panel(other_text_block, footer=Button(None, "A button"))
+
+    window = Stack(
+        [button_panel, other_text_block_panel],
+        splits=[None, 20],
+        orientation=Orientation.HORIZONTAL,
+    )
+
+    # TODO: configure eventual window object to attempt a navigation control override if it receives
+    # a navigation control input. That means that there was no element which wanted to do something
+    # with that control. If it is a right or left, or up or down, it should find the active element
+    # and just go ahead and focus_next or focus_prev
+
+    screen.keypad(1)
+    screen.nodelay(1)
+
+    curses.curs_set(0)
+    curses.raw()
+    curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+    curses.mouseinterval(5)
+    print("\033[?1003h")  # enable mouse tracking with the XTERM API
+    # https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-Mouse-Tracking
+    curses.flushinp()
+    curses.noecho()
+    screen.clear()
 
     async def await_getch(screen: "curses._CursesWindow"):
         while True:
@@ -1216,7 +1410,8 @@ if __name__ == "__main__":
         draw_frame = DrawFrame(
             screen, (ScreenCoord(0, 3), ScreenCoord(width - 1, height - 1))
         )
-        await button_panel.frame(draw_frame)
+        await window.frame(draw_frame)
+        window.focus()
         while True:
             key = await await_getch(screen)
             screen.erase()  # Do not use clear(), as it will cause flickering artifacts
@@ -1228,7 +1423,7 @@ if __name__ == "__main__":
                 draw_frame = DrawFrame(
                     screen, (ScreenCoord(0, 3), ScreenCoord(width - 1, height - 1))
                 )
-                await button_panel.frame(draw_frame)
+                await window.frame(draw_frame)
             elif key == curses.KEY_MOUSE:
                 _, x, y, _, button = curses.getmouse()
                 mouse_x, mouse_y, mouse_button = x, y, button
@@ -1236,9 +1431,10 @@ if __name__ == "__main__":
             elif key == ord("q"):
                 break
 
-            await button_panel.update(key, mouse_x, mouse_y, mouse_button)
-            await button_panel.draw()
-            await button_panel.execute()
+            await window.update(key, mouse_x, mouse_y, mouse_button)
+            await _active_element.navigation_update(NavigationInput.from_key_code(key))
+            await window.execute()
+            await window.draw()
 
     asyncio.run(main())
 
