@@ -1,108 +1,180 @@
 from typing import Tuple, Callable, Awaitable, Optional, List, Self, Sequence, Any
 
 import curses
-import clipman
-from enum import Enum
 
-from autograder.logging.tui.utils.wrap import (
-    smart_wrap_text,
-    right_pad_line,
-    cut_line_with_ellipse,
-)
-
-import time
-
-CLIPBOARD_AVAILABLE = False
-
-try:
-    clipman.init()
-    CLIPBOARD_AVAILABLE = True
-except:
-    pass
-
-# TODO: rename TUIObject to TUIElement, since I'm calling them elements everywhere else
-# TODO: should going back focus the first element anyways?
+from autograder.logging.tui.screen import ScreenCoord
+from autograder.logging.tui.enums import NavigationInput, Orientation
 
 
-class ScreenCoord:
-    __slots__ = ["x", "y"]
-
-    x: int
-    y: int
-
-    def __init__(self, x: int, y: int):
-        self.x = x
-        self.y = y
-
-    def __repr__(self) -> str:
-        return f"ScreenCoord(x={self.x}, y={self.y})"
+async def await_getch(screen: "curses._CursesWindow") -> int:
+    while True:
+        key = screen.getch()
+        if key != curses.ERR:
+            return key
+        await asyncio.sleep(0.025)
 
 
-class Orientation(Enum):
-    HORIZONTAL = "horizontal"
-    VERTICAL = "vertical"
-
-
-_focused_elements = []
-_active_element = None
-
-
-# Maybe create some sort of queue for updating the focus that is always ran during the execute step?
-class NavigationInput(Enum):
-    UP = "up"
-    DOWN = "down"
-    LEFT = "left"
-    RIGHT = "right"
-    NEXT = "next"
-    PREV = "prev"
-    FIRST = "first"
-    LAST = "last"
-    INTERACT = "interact"
-    EXIT = "exit"
-    QUIT = "quit"
-    NONE = "none"
-
-    @classmethod
-    def from_key_code(cls, key_code: int) -> "NavigationInput":
-        match key_code:
-            case curses.KEY_MOUSE:
-                return NavigationInput.NONE
-            case curses.KEY_UP | 119:
-                return NavigationInput.UP
-            case curses.KEY_DOWN | 115:
-                return NavigationInput.DOWN
-            case curses.KEY_RIGHT | 100:
-                return NavigationInput.RIGHT
-            case curses.KEY_LEFT | 97:
-                return NavigationInput.LEFT
-            case 9:
-                return NavigationInput.NEXT
-            case 353:
-                return NavigationInput.PREV
-            case 337:
-                return NavigationInput.FIRST
-            case 336:
-                return NavigationInput.LAST
-            case 10:
-                return NavigationInput.INTERACT
-            case 27:
-                return NavigationInput.EXIT
-            case 17:
-                return NavigationInput.QUIT
-            case _:
-                return NavigationInput.NONE
-
-
-class DrawFrame:
+# TODO: need to clear regions of the screen on redraw
+# clears should be a seperate list from pending draws
+# clears should have an overlap check
+class TUIWindow:
     screen: "curses._CursesWindow"
-    bounds: Optional[Tuple[ScreenCoord, ScreenCoord]]
+    top_level_element: "TUIElement"
+    bounds: Tuple[ScreenCoord, ScreenCoord]
+    resize: bool
+
+    _pending_clears: List[Tuple[ScreenCoord, ScreenCoord]]
+    _pending_draws: List[List[Tuple[int, int, str, int]]]
+    _focused_elements: List["TUIElement"]
+    _active_element: "TUIElement"
+    _screen_size: Tuple[int, int]
+    _screen_padding: Tuple[int, int, int, int]
 
     def __init__(
         self,
         screen: "curses._CursesWindow",
+        top_level_element: "TUIElement",
+        bounds: Tuple[ScreenCoord, ScreenCoord] = None,
+        resize: bool = True,
+    ) -> None:
+        self.screen = screen
+        self.top_level_element = top_level_element
+
+        self._pending_draws = []
+        self._screen_size = None
+        self._resize = True
+        self._focused_elements = []
+        self._active_element = None  # TODO: focus an element here
+
+        if bounds is None:
+            bounds = (
+                ScreenCoord(0, 0),
+                ScreenCoord(self.screen_width, self.screen_height),
+            )
+        self.bounds = bounds
+        self._screen_padding = (
+            self.bounds[0].y,
+            self.screen_width - self.bounds[1].x,
+            self.screen_height - self.bounds[1].y,
+            self.bounds[0].x,
+        )  # Top, Right, Bottom, Left
+        self.resize = resize
+
+    def schedule_draw(
+        self, position: ScreenCoord, text: str, style: int = None, z: int = 0
+    ) -> None:
+        if z + 1 > len(self.pending_draws):
+            self.pending_draws.extend(
+                [[] for _ in range(z + 1 - len(self.pending_draws))]
+            )
+        self._pending_draws[z].append((position, text, style))
+
+    def run_draw_calls(self) -> None:
+        for draw_layer in self.pending_draws:
+            for draw_call in draw_layer:
+                x, y, text, style = draw_call
+                self.run_draw_call(screen, x, y, text, style)
+        self.pending_draws = []
+
+    def run_draw_call(self, x: int, y: int, text: str, style: int = None) -> None:
+        # Curses will fail if we try to draw to the bottom right corner of the
+        # screen, so we need to check if we are trying to do so, and just draw
+        # that character seperate
+        if x + len(text) >= self.screen_width and y >= self.screen_height - 1:
+            if style is None:
+                try:
+                    screen.addstr(y, x, text[-1])
+                except curses.error:
+                    pass
+            else:
+                try:
+                    screen.addstr(y, x, text[-1], style)
+                except curses.error:
+                    pass
+            if len(text) == 1:
+                return
+            text = text[:-1]
+
+        if style is None:
+            screen.addstr(y, x, text)
+        else:
+            screen.addstr(y, x, text, style)
+
+    async def draw(self) -> None:
+        if len(self._pending_draws) > 0:
+            self.run_draw_calls()
+
+    async def run_window(self) -> None:
+        height, width = screen.getmaxyx()
+        draw_frame = DrawFrame(
+            screen, (ScreenCoord(0, 3), ScreenCoord(width - 1, height - 1))
+        )
+        await window.frame(draw_frame)
+        window.focus()
+        while True:
+            key = await await_getch(screen)
+            screen.erase()  # Do not use clear(), as it will cause flickering artifacts
+            screen.addstr(f"Key: {key}")
+
+            screen.delch()
+
+            mouse_x, mouse_y, mouse_button = None, None, None
+            if key == curses.KEY_RESIZE:
+                height, width = screen.getmaxyx()
+                draw_frame = DrawFrame(
+                    screen, (ScreenCoord(0, 3), ScreenCoord(width - 1, height - 1))
+                )
+                await window.frame(draw_frame)
+            elif key == curses.KEY_MOUSE:
+                _, x, y, _, button = curses.getmouse()
+                mouse_x, mouse_y, mouse_button = x, y, button
+                screen.addstr(1, 0, f"Mouse info: {x}, {y} - {button}")
+            elif key == ord("q"):
+                break
+
+            await window.update(key, mouse_x, mouse_y, mouse_button)
+            await _active_element.navigation_update(NavigationInput.from_key_code(key))
+            await window.execute()
+            await window.draw()
+
+    # TODO: Find the active element and focus next or prev
+    async def update_navigation(navigation_input: NavigationInput) -> None:
+        pass
+
+    def _get_screen_size(self) -> None:
+        height, width = self.screen.getmaxyx()
+        self._screen_size = (width, height)
+
+    @property
+    def screen_width(self) -> int:
+        if self._screen_size is None:
+            self._get_screen_size()
+        return self._screen_size[0]
+
+    @property
+    def screen_height(self) -> int:
+        if self._screen_size is None:
+            self._get_screen_size()
+        return self._screen_size[1]
+
+    @property
+    def width(self) -> int:
+        # The width of the window (which is the maximum legal drawing area)
+        pass
+
+
+class DrawFrame:
+    window: TUIWindow
+    bounds: Optional[Tuple[ScreenCoord, ScreenCoord]]
+
+    _has_drawn: bool = False
+
+    def __init__(
+        self,
+        window: TUIWindow,
         bounds: Optional[Tuple[ScreenCoord, ScreenCoord]] = None,
     ):
-        self.screen = screen
+        self.window = window
         if bounds is not None:
             bounds = (
                 ScreenCoord(max(0, bounds[0].x), max(0, bounds[0].y)),
@@ -115,8 +187,15 @@ class DrawFrame:
                 bounds = None
         self.bounds = bounds
 
-    # TODO: fix this so that overlays are always on top of non-overlays
-    def draw(self, x: int, y: int, text: str, style: int = None, overlay: bool = False):
+    def draw(
+        self,
+        x: int,
+        y: int,
+        text: str,
+        style: int = None,
+        overlay: bool = False,
+        z: int = 0,
+    ):
         if not isinstance(x, int):
             raise ValueError(
                 f"`DrawFrame.draw` expected `x` to be type `int`, received type {type(x)}."
@@ -149,42 +228,21 @@ class DrawFrame:
         ):
             return
 
-        screen_height, screen_width = screen.getmaxyx()
-        if adjusted_y > screen_height:
+        if adjusted_y > self.window.height:
             return
 
         # Now, lets trim the text to fit within the bounds
         if (not overlay and (len(text) + adjusted_x > self.bounds[1].x)) or (
-            len(text) + adjusted_x > screen_width
+            len(text) + adjusted_x > self.window.width
         ):
             text = text[
                 : min(
-                    (self.bounds[1].x - adjusted_x) + 1, (screen_width - adjusted_x) + 1
+                    (self.bounds[1].x - adjusted_x) + 1,
+                    (self.window.width - adjusted_x) + 1,
                 )
             ]
 
-        # Curses will fail if we try to draw to the bottom right corner of the
-        # screen, so we need to check if we are trying to do so, and just draw
-        # that character seperate
-        if adjusted_x + len(text) >= screen_width and adjusted_y >= screen_height - 1:
-            if style is not None:
-                try:
-                    self.screen.addstr(adjusted_y, adjusted_x, text[-1], style)
-                except curses.error:
-                    pass
-            else:
-                try:
-                    self.screen.addstr(adjusted_y, adjusted_x, text[-1])
-                except curses.error:
-                    pass
-            if len(text) == 1:
-                return
-            text = text[:-1]
-
-        if style is not None:
-            self.screen.addstr(adjusted_y, adjusted_x, text, style)
-        else:
-            self.screen.addstr(adjusted_y, adjusted_x, text)
+        self.window.schedule_draw(x, y, text, style, z)
 
     def pad(self, horizontal: int, vertical: int) -> "DrawFrame":
         if (
@@ -406,12 +464,12 @@ class DrawFrame:
         return f"DrawFrame(screen={self.screen}, bounds={self.bounds})"
 
 
-class TUIObject:
+class TUIElement:
     IS_INTERACTABLE: bool = False
 
     draw_frame: DrawFrame
-    children: Optional[List["TUIObject"]] = None
-    parent: Optional["TUIObject"] = None
+    children: Optional[List["TUIElement"]] = None
+    parent: Optional["TUIElement"] = None
 
     _is_focusable = None
     _focusable_children = None
@@ -419,6 +477,15 @@ class TUIObject:
     def __init__(self) -> None:
         self.draw_frame = DrawFrame(None)
 
+    # What things invalidate the drawn state?
+    # - Focusing an element
+    # - Internal logic in update
+    # - Reframing
+
+    # Maybe all of the draws should be defered, so that we don't have logic
+    # issues with updates
+
+    # TODO: maybe frame should say how big it is?
     async def frame(self, draw_frame: DrawFrame) -> None:
         """Sets the location for the object to be drawn in the view"""
         self.draw_frame = draw_frame
@@ -441,17 +508,17 @@ class TUIObject:
         """Execute any actions that the object needs to perform"""
         pass
 
-    async def draw(self) -> None:
+    async def draw(self, draw_frame: DrawFrame) -> None:
         """Draw the object to the screen"""
-        raise NotImplementedError("`TUIObject`s must implement a draw method")
+        raise NotImplementedError("`TUIElement`s must implement a draw method")
 
-    def add_child(self, child: "TUIObject") -> None:
+    def add_child(self, child: "TUIElement") -> None:
         if self.children is None:
             self.children = []
 
         if child in self.children:
             raise ValueError(
-                f"`TUIObject` received a child which is already a child of this object."
+                f"`TUIElement` received a child which is already a child of this object."
             )
 
         self.children.append(child)
@@ -460,7 +527,7 @@ class TUIObject:
         if child.is_focusable:
             self._is_focusable = True
 
-    def remove_child(self, child: "TUIObject") -> None:
+    def remove_child(self, child: "TUIElement") -> None:
         try:
             self.children.remove(child)
             self._is_focusable = None
@@ -487,7 +554,7 @@ class TUIObject:
         return self._is_focusable
 
     @property
-    def focusable_children(self) -> List["TUIObject"]:
+    def focusable_children(self) -> List["TUIElement"]:
         if self.children is None:
             return None
         if self._focusable_children is None:
@@ -526,7 +593,7 @@ class TUIObject:
                 if not self.parent is None:
                     self.parent.focus_next()
             else:
-                child.focus(last=False)
+                child.focus()
         elif self.parent is not None:
             self.parent.focus_next()
 
@@ -551,24 +618,19 @@ class TUIObject:
                 if not self.parent is None:
                     self.parent.focus_prev()
             else:
-                child.focus(last=True)
+                child.focus()
         elif self.parent is not None:
             self.parent.focus_prev()
 
-    def focus(self, last: bool = False) -> None:
+    def focus(self) -> None:
         if not self.is_focusable:
             if self.parent is not None:
                 self.parent.focus_next()
 
         if self.children is not None and len(self.children) > 0:
-            if last:
-                iterator = range(len(self.children) - 1, -1, -1)
-            else:
-                iterator = range(len(self.children))
-            for child_index in iterator:
-                child = self.children[child_index]
+            for child in self.children:
                 if child.is_focusable:
-                    return child.focus(last=last)
+                    return child.focus()
 
         _focused_elements.clear()
         parent = self.parent
@@ -603,7 +665,10 @@ class TUIObject:
 # - Better colors for the draw frame (convert to curses crap)
 
 
-class Fill(TUIObject):
+class Fill(TUIElement):
+    fill_char: str
+    style: int
+
     def __init__(self, fill_char: str, style: int) -> None:
         super().__init__()
         self.fill_char = fill_char
@@ -619,10 +684,14 @@ class Fill(TUIObject):
         return f"Fill(fill_char={repr(self.fill_char)}, style={self.style})"
 
 
-class Stack(TUIObject):
+class Stack(TUIElement):
+    orientation: Orientation
+    element_padding: int
+    divider: str
+
     def __init__(
         self,
-        elements: List[TUIObject],
+        elements: List[TUIElement],
         orientation: Orientation,
         splits: int | List[int | float | None] | None = None,
         element_padding: int = 0,
@@ -755,15 +824,23 @@ class Stack(TUIObject):
         return f"Stack(elements={self.children}, orientation={self.orientation}, splits={self.splits}, element_padding={self.element_padding}, divider={self.divider})"
 
 
-class Panel(TUIObject):
+class Panel(TUIElement):
+    content: TUIElement
+    header: Optional[TUIElement]
+    footer: Optional[TUIElement]
+    vertical_padding: int
+    horizontal_padding: int
+    header_height: int
+    footer_height: int
+
     def __init__(
         self,
-        content: TUIObject,
+        content: TUIElement,
         vertical_padding: int = 0,
         horizontal_padding: int = 1,
-        header: Optional[TUIObject] = None,
+        header: Optional[TUIElement] = None,
         header_height: int = 1,
-        footer: Optional[TUIObject] = None,
+        footer: Optional[TUIElement] = None,
         footer_height: int = 1,
     ):
         super().__init__()
@@ -848,7 +925,7 @@ class Panel(TUIObject):
                 await self.parent.navigation_update(navigation_input)
             return
 
-        # TODO: figure out a better way for the TUIObjects to query
+        # TODO: figure out a better way for the TUIElements to query
         # their focusable children
         match navigation_input:
             case NavigationInput.UP:
@@ -948,7 +1025,7 @@ class Panel(TUIObject):
 
 
 # TODO: Only handles single-line text, replace text here with the text wrap stuff
-class Button(TUIObject):
+class Button(TUIElement):
     IS_INTERACTABLE = True
 
     hover: bool
@@ -980,15 +1057,17 @@ class Button(TUIObject):
         if self.parent is not None:
             await self.parent.navigation_update(navigation_input)
 
-    async def draw(self) -> None:
-        style = None
+    async def draw(self, draw_frame: DrawFrame) -> None:
+        if not self.draw_frame.is_drawable:
+            return
+
+        style: int = None
         if self.clicked:
             style = curses.color_pair(1) | curses.A_REVERSE | curses.A_BOLD
         elif self.is_active() or self.hover:
             style = (
                 curses.color_pair(1) | curses.A_BOLD | curses.A_REVERSE | curses.A_BOLD
             )
-
         else:
             style = curses.color_pair(1) | curses.A_REVERSE
 
@@ -1067,242 +1146,6 @@ class Button(TUIObject):
         return f"Button(label={repr(self.label)})"
 
 
-class CopyableObject(TUIObject):
-    IS_INTERACTABLE = True
-
-    COPY_ICON = "⧉"
-    MESSAGE_DISPLAY_TIME = 1
-
-    copied: bool
-    selected: bool
-    hovered: bool
-    copied_timestamp: float
-
-    def __init__(
-        self,
-        object: TUIObject,
-        text_to_copy: str,
-        copy_button_style: int = 0,
-        copy_button_highlight_style: int = None,
-    ):
-        super().__init__()
-        self.object = object
-        self.text_to_copy = text_to_copy
-        self.copy_button_style = copy_button_style
-        if copy_button_highlight_style is None:
-            copy_button_highlight_style = self.copy_button_style | curses.A_BOLD
-        self.copy_button_highlight_style = copy_button_highlight_style
-        self.hovered = False
-        self.selected = False
-        self.copied = False
-        self.copied_timestamp = 0
-
-    async def frame(self, draw_frame: DrawFrame) -> None:
-        self.draw_frame = draw_frame
-        if not self.draw_frame.is_drawable:
-            return
-        # We need to reserve the far right column for the copy button
-        wrapped_object_frame = draw_frame.subframe(
-            (
-                ScreenCoord(0, 0),
-                ScreenCoord(draw_frame.width - 3, draw_frame.height - 1),
-            )
-        )
-        await self.object.frame(wrapped_object_frame)
-
-    async def navigation_update(self, navigation_input: NavigationInput) -> None:
-        if navigation_input is NavigationInput.NONE:
-            return
-
-        match navigation_input:
-            case NavigationInput.INTERACT:
-                self.copied = True
-
-        if self.parent is not None:
-            await self.parent.navigation_update(navigation_input)
-
-    async def draw(self) -> None:
-        if self.hovered or self.is_active():
-            style = self.copy_button_highlight_style
-        else:
-            style = self.copy_button_style
-
-        if not self.draw_frame.is_drawable:
-            return
-        self.draw_frame.draw(
-            self.draw_frame.width - 1,
-            0,
-            CopyableObject.COPY_ICON,
-            style,
-        )
-
-        if time.time() < self.copied_timestamp + CopyableObject.MESSAGE_DISPLAY_TIME:
-            # TODO: query the size of the screen so that we can push this overlay
-            # message around to always show up
-            # TODO: maybe create a late_draw method which is called after the normal
-            # draw, so that we can ensure overlays function correctly
-            # (How do we figure out if that is too much overhead?)
-            if CLIPBOARD_AVAILABLE:
-                self.draw_frame.draw(
-                    self.draw_frame.width - 21,
-                    -1,
-                    "(Copied to clipboard)",
-                    overlay=True,
-                )
-            else:
-                self.draw_frame.draw(
-                    self.draw_frame.width - 76,
-                    -1,
-                    "(Install `xsel` or `xclip` if you want to be able to copy to your clipboard)",
-                    overlay=True,
-                )
-
-        await self.object.draw()
-
-    async def update(
-        self, event_code: int, mouse_x: int, mouse_y: int, mouse_button: int
-    ) -> None:
-        if not self.draw_frame.is_drawable:
-            return
-
-        if event_code == curses.KEY_MOUSE:
-            if self.draw_frame.contains(mouse_x, mouse_y) and mouse_button in [
-                curses.BUTTON1_PRESSED,
-                curses.BUTTON1_CLICKED,
-                curses.BUTTON1_RELEASED,
-            ]:
-                self.selected = True
-
-            local_x, local_y = self.draw_frame.local(mouse_x, mouse_y)
-            if local_x == self.draw_frame.width - 1 and local_y == 0:
-                self.hovered = True
-                if mouse_button in [
-                    curses.BUTTON1_PRESSED,
-                    curses.BUTTON1_CLICKED,
-                    curses.BUTTON1_RELEASED,
-                ]:
-                    self.copied = True
-            else:
-                self.hovered = False
-
-        await self.object.update(
-            event_code=event_code,
-            mouse_x=mouse_x,
-            mouse_y=mouse_y,
-            mouse_button=mouse_button,
-        )
-
-    async def execute(self) -> None:
-        if self.copied:
-            self.copied = False
-            self.copied_timestamp = time.time()
-            if CLIPBOARD_AVAILABLE:
-                clipman.set(self.text_to_copy)
-        await self.object.execute()
-
-    def __repr__(self) -> str:
-        return f"CopyableText(object={self.object}, text_to_copy={repr(self.text_to_copy)}, copy_button_style={self.copy_button_style})"
-
-
-class Text(TUIObject):
-    def __init__(
-        self, text: str, text_style: int = 0, new_line_character_style: int = 0
-    ) -> None:
-        super().__init__()
-        self.text = text
-        self.lines: List[str] = []
-        self.new_line_characters: List[Tuple[int, int]] = []
-        self.text_style = text_style
-        self.new_line_character_style = new_line_character_style
-
-    async def frame(self, draw_frame: DrawFrame) -> None:
-        self.draw_frame = draw_frame
-
-        if not self.draw_frame.is_drawable:
-            return
-
-        if self.draw_frame.height <= 0 or self.draw_frame.width <= 0:
-            return
-
-        # We are using a unicode character in the private use section so that
-        # if there are line break characters already in the text we do not
-        # format them like the characters we are adding
-        real_lines = self.text.split("\n")
-        real_lines = [
-            line + "\uf026" if idx != len(real_lines) - 1 else line
-            for idx, line in enumerate(real_lines)
-        ]
-        wrapped_lines: List[str] = []
-        for line in real_lines:
-            wrapped_lines.extend(
-                smart_wrap_text(line, target_width=self.draw_frame.width)
-            )
-
-        # Now, we need to find our newline characters and take them out because
-        # we want to format them differently, also pad or truncate the lines
-        formatted_lines: List[str] = []
-        new_line_locations: List[Tuple[int, int]] = []
-        for line_number, line in enumerate(wrapped_lines):
-            if len(line) > self.draw_frame.width:
-                line = cut_line_with_ellipse(line, self.draw_frame.width)
-            for character_number, character in enumerate(line):
-                if character == "\uf026":
-                    new_line_locations.append((character_number, line_number))
-            line = line.replace("\uf026", "¶")
-            line = right_pad_line(line, self.draw_frame.width)
-            formatted_lines.append(line)
-
-        if len(formatted_lines) > self.draw_frame.height:
-            formatted_lines = formatted_lines[: self.draw_frame.height]
-            last_line = cut_line_with_ellipse(
-                formatted_lines[-1], self.draw_frame.width
-            )
-            formatted_lines[-1] = last_line
-
-        self.lines = formatted_lines
-        self.new_line_characters = new_line_locations
-
-    async def draw(self) -> None:
-        for line_idx, line in enumerate(self.lines):
-            self.draw_frame.draw(0, line_idx, line, self.text_style)
-
-        for x, y in self.new_line_characters:
-            self.draw_frame.draw(x, y, "¶", self.new_line_character_style)
-
-    def __repr__(self) -> str:
-        return f"Text(text={repr(self.text)}, text_style={self.text_style})"
-
-
-# TODO: fix the value coloring
-class DataValue(TUIObject):
-    label: str
-    value: str
-
-    def __init__(self, label: str, value: str) -> None:
-        super().__init__()
-        self.label = label + ":"
-        self.value = value
-        self.label_text_box = Text(
-            text=self.label, text_style=curses.color_pair(0) | curses.A_BOLD
-        )
-        self.value_text_box = Text(
-            text=self.value, text_style=curses.color_pair(2) | curses.A_BOLD
-        )
-
-    async def frame(self, draw_frame: DrawFrame) -> None:
-        self.draw_frame = draw_frame
-        # TODO: how should we handle it when there is not enough space even for the label?
-        frames = draw_frame.split(
-            [len(self.label) + 1, None], orientation=Orientation.HORIZONTAL
-        )
-        await self.label_text_box.frame(frames[0])
-        await self.value_text_box.frame(frames[1])
-
-    async def draw(self) -> None:
-        await self.label_text_box.draw()
-        await self.value_text_box.draw()
-
-
 # TODO: figure out how to have something scrollable...
 # The issue is that the scrollable item needs to know how big it is, based on its internals...
 # the problem for us is that we have designed everything with a top down control scheme
@@ -1376,14 +1219,9 @@ if __name__ == "__main__":
 
     window = Stack(
         [button_panel, other_text_block_panel],
-        splits=[None, 20],
+        splits=[None, 35],
         orientation=Orientation.HORIZONTAL,
     )
-
-    # TODO: configure eventual window object to attempt a navigation control override if it receives
-    # a navigation control input. That means that there was no element which wanted to do something
-    # with that control. If it is a right or left, or up or down, it should find the active element
-    # and just go ahead and focus_next or focus_prev
 
     screen.keypad(1)
     screen.nodelay(1)
@@ -1397,44 +1235,6 @@ if __name__ == "__main__":
     curses.flushinp()
     curses.noecho()
     screen.clear()
-
-    async def await_getch(screen: "curses._CursesWindow"):
-        while True:
-            key = screen.getch()
-            if key != curses.ERR:
-                return key
-            await asyncio.sleep(0.025)
-
-    async def main():
-        height, width = screen.getmaxyx()
-        draw_frame = DrawFrame(
-            screen, (ScreenCoord(0, 3), ScreenCoord(width - 1, height - 1))
-        )
-        await window.frame(draw_frame)
-        window.focus()
-        while True:
-            key = await await_getch(screen)
-            screen.erase()  # Do not use clear(), as it will cause flickering artifacts
-            screen.addstr(f"Key: {key}")
-
-            mouse_x, mouse_y, mouse_button = None, None, None
-            if key == curses.KEY_RESIZE:
-                height, width = screen.getmaxyx()
-                draw_frame = DrawFrame(
-                    screen, (ScreenCoord(0, 3), ScreenCoord(width - 1, height - 1))
-                )
-                await window.frame(draw_frame)
-            elif key == curses.KEY_MOUSE:
-                _, x, y, _, button = curses.getmouse()
-                mouse_x, mouse_y, mouse_button = x, y, button
-                screen.addstr(1, 0, f"Mouse info: {x}, {y} - {button}")
-            elif key == ord("q"):
-                break
-
-            await window.update(key, mouse_x, mouse_y, mouse_button)
-            await _active_element.navigation_update(NavigationInput.from_key_code(key))
-            await window.execute()
-            await window.draw()
 
     asyncio.run(main())
 
