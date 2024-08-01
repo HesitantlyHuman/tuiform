@@ -2,6 +2,7 @@ from typing import Tuple, List
 
 import curses
 
+from autograder.logging.tui.enums import Orientation
 from autograder.logging.tui.base import TUIElement, DrawFrame
 from autograder.logging.tui.utils.wrap import (
     smart_wrap_text,

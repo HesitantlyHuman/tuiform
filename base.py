@@ -1,5 +1,8 @@
 from typing import Tuple, Callable, Awaitable, Optional, List, Self, Sequence, Any
 
+import asyncio
+from os import environ
+
 import curses
 
 from autograder.logging.tui.screen import ScreenCoord
@@ -14,17 +17,14 @@ async def await_getch(screen: "curses._CursesWindow") -> int:
         await asyncio.sleep(0.025)
 
 
-# TODO: need to clear regions of the screen on redraw
-# clears should be a seperate list from pending draws
-# clears should have an overlap check
 class TUIWindow:
     screen: "curses._CursesWindow"
     top_level_element: "TUIElement"
     bounds: Tuple[ScreenCoord, ScreenCoord]
     resize: bool
 
-    _pending_clears: List[Tuple[ScreenCoord, ScreenCoord]]
-    _pending_draws: List[List[Tuple[int, int, str, int]]]
+    _needs_redraw: bool
+    _pending_draws: List[List[Tuple[ScreenCoord, str, int]]]
     _focused_elements: List["TUIElement"]
     _active_element: "TUIElement"
     _screen_size: Tuple[int, int]
@@ -45,6 +45,7 @@ class TUIWindow:
         self._resize = True
         self._focused_elements = []
         self._active_element = None  # TODO: focus an element here
+        self._needs_redraw = False
 
         if bounds is None:
             bounds = (
@@ -63,23 +64,27 @@ class TUIWindow:
     def schedule_draw(
         self, position: ScreenCoord, text: str, style: int = None, z: int = 0
     ) -> None:
-        if z + 1 > len(self.pending_draws):
-            self.pending_draws.extend(
-                [[] for _ in range(z + 1 - len(self.pending_draws))]
+        if z + 1 > len(self._pending_draws):
+            self._pending_draws.extend(
+                [[] for _ in range(z + 1 - len(self._pending_draws))]
             )
         self._pending_draws[z].append((position, text, style))
 
     def run_draw_calls(self) -> None:
-        for draw_layer in self.pending_draws:
+        for draw_layer in self._pending_draws:
             for draw_call in draw_layer:
-                x, y, text, style = draw_call
-                self.run_draw_call(screen, x, y, text, style)
+                pos, text, style = draw_call
+                self.run_draw_call(pos.x, pos.y, text, style)
         self.pending_draws = []
 
     def run_draw_call(self, x: int, y: int, text: str, style: int = None) -> None:
         # Curses will fail if we try to draw to the bottom right corner of the
         # screen, so we need to check if we are trying to do so, and just draw
         # that character seperate
+        with open("output.txt", "a") as f:
+            print(f"Position: {x}, {y}\nContent: {repr(text)}\nStyle: {style}", file=f)
+            print(f"Screen Size: {self._screen_size}", file=f)
+            print(f"Width of text: {len(text)}", file=f)
         if x + len(text) >= self.screen_width and y >= self.screen_height - 1:
             if style is None:
                 try:
@@ -101,41 +106,54 @@ class TUIWindow:
             screen.addstr(y, x, text, style)
 
     async def draw(self) -> None:
-        if len(self._pending_draws) > 0:
-            self.run_draw_calls()
+        if self._needs_redraw:
+            await self.top_level_element.draw()
+        self.run_draw_calls()
+        self._needs_redraw = False
+
+    async def frame(self) -> None:
+        self._screen_size = None
+        new_bounds = (
+            ScreenCoord(
+                self._screen_padding[3],
+                self._screen_padding[0],
+            ),
+            ScreenCoord(
+                self.screen_width - self._screen_padding[1] - 1,
+                self.screen_height - self._screen_padding[2] - 1,
+            ),
+        )
+        self.bounds = new_bounds
+        top_level_draw_frame = DrawFrame(self, bounds=self.bounds)
+        await self.top_level_element.frame(top_level_draw_frame)
 
     async def run_window(self) -> None:
-        height, width = screen.getmaxyx()
-        draw_frame = DrawFrame(
-            screen, (ScreenCoord(0, 3), ScreenCoord(width - 1, height - 1))
-        )
-        await window.frame(draw_frame)
-        window.focus()
+        await self.frame()
+        self.top_level_element.focus()
         while True:
             key = await await_getch(screen)
             screen.erase()  # Do not use clear(), as it will cause flickering artifacts
             screen.addstr(f"Key: {key}")
 
-            screen.delch()
-
             mouse_x, mouse_y, mouse_button = None, None, None
             if key == curses.KEY_RESIZE:
-                height, width = screen.getmaxyx()
-                draw_frame = DrawFrame(
-                    screen, (ScreenCoord(0, 3), ScreenCoord(width - 1, height - 1))
-                )
-                await window.frame(draw_frame)
+                await self.frame()
             elif key == curses.KEY_MOUSE:
                 _, x, y, _, button = curses.getmouse()
                 mouse_x, mouse_y, mouse_button = x, y, button
                 screen.addstr(1, 0, f"Mouse info: {x}, {y} - {button}")
-            elif key == ord("q"):
+            elif key == ord("q"):  # TODO: change this to check for the ctrc
                 break
 
-            await window.update(key, mouse_x, mouse_y, mouse_button)
-            await _active_element.navigation_update(NavigationInput.from_key_code(key))
-            await window.execute()
-            await window.draw()
+            if self._active_element is None:
+                self.top_level_element.focus()
+
+            await self.top_level_element.update(key, mouse_x, mouse_y, mouse_button)
+            await self._active_element.navigation_update(
+                NavigationInput.from_key_code(key)
+            )
+            await self.top_level_element.execute()
+            await self.draw()
 
     # TODO: Find the active element and focus next or prev
     async def update_navigation(navigation_input: NavigationInput) -> None:
@@ -159,8 +177,11 @@ class TUIWindow:
 
     @property
     def width(self) -> int:
-        # The width of the window (which is the maximum legal drawing area)
-        pass
+        return (self.bounds[1].x - self.bounds[0].x) + 1
+
+    @property
+    def height(self) -> int:
+        return (self.bounds[1].y - self.bounds[0].y) + 1
 
 
 class DrawFrame:
@@ -242,7 +263,9 @@ class DrawFrame:
                 )
             ]
 
-        self.window.schedule_draw(x, y, text, style, z)
+        self.window.schedule_draw(
+            ScreenCoord(x, y), text, style, z
+        )  # TODO: figure out if we want to make everything use screen cords.
 
     def pad(self, horizontal: int, vertical: int) -> "DrawFrame":
         if (
@@ -250,9 +273,9 @@ class DrawFrame:
             or self.width <= 2 * horizontal
             or self.height <= 2 * vertical
         ):
-            return DrawFrame(self.screen, None)
+            return DrawFrame(self.window, None)
         return DrawFrame(
-            self.screen,
+            self.window,
             (
                 ScreenCoord(self.bounds[0].x + horizontal, self.bounds[0].y + vertical),
                 ScreenCoord(self.bounds[1].x - horizontal, self.bounds[1].y - vertical),
@@ -261,7 +284,7 @@ class DrawFrame:
 
     def subframe(self, bounds: Tuple[ScreenCoord, ScreenCoord]) -> "DrawFrame":
         if not self.is_drawable:
-            return DrawFrame(self.screen, None)
+            return DrawFrame(self.window, None)
         bounds = (
             ScreenCoord(max(0, bounds[0].x), max(0, bounds[0].y)),
             ScreenCoord(min(self.width, bounds[1].x), min(self.height, bounds[1].y)),
@@ -272,13 +295,13 @@ class DrawFrame:
             or bounds[0].x > bounds[1].x  # Inverted horizontal bounds
             or bounds[0].y > bounds[1].y  # Inverted vertical bounds
         ):
-            return DrawFrame(self.screen, None)
+            return DrawFrame(self.window, None)
 
         relative_bounds = (
             ScreenCoord(bounds[0].x + self.bounds[0].x, bounds[0].y + self.bounds[0].y),
             ScreenCoord(bounds[1].x + self.bounds[0].x, bounds[1].y + self.bounds[0].y),
         )
-        return DrawFrame(self.screen, relative_bounds)
+        return DrawFrame(self.window, relative_bounds)
 
     def split(
         self, splits: int | List[int | float | None], orientation: Orientation
@@ -392,11 +415,11 @@ class DrawFrame:
                 x = self.bounds[0].x
                 for length in lengths:
                     if length is None:
-                        subframes.append(DrawFrame(self.screen, None))
+                        subframes.append(DrawFrame(self.window, None))
                     else:
                         subframes.append(
                             DrawFrame(
-                                self.screen,
+                                self.window,
                                 (
                                     ScreenCoord(x, self.bounds[0].y),
                                     ScreenCoord(x + (length - 1), self.bounds[1].y),
@@ -408,11 +431,11 @@ class DrawFrame:
                 y = self.bounds[0].y
                 for length in lengths:
                     if length is None:
-                        subframes.append(DrawFrame(self.screen, None))
+                        subframes.append(DrawFrame(self.window, None))
                     else:
                         subframes.append(
                             DrawFrame(
-                                self.screen,
+                                self.window,
                                 (
                                     ScreenCoord(self.bounds[0].x, y),
                                     ScreenCoord(self.bounds[1].x, y + (length - 1)),
@@ -468,6 +491,7 @@ class TUIElement:
     IS_INTERACTABLE: bool = False
 
     draw_frame: DrawFrame
+    window: TUIWindow
     children: Optional[List["TUIElement"]] = None
     parent: Optional["TUIElement"] = None
 
@@ -476,6 +500,7 @@ class TUIElement:
 
     def __init__(self) -> None:
         self.draw_frame = DrawFrame(None)
+        self.window = None
 
     # What things invalidate the drawn state?
     # - Focusing an element
@@ -489,6 +514,7 @@ class TUIElement:
     async def frame(self, draw_frame: DrawFrame) -> None:
         """Sets the location for the object to be drawn in the view"""
         self.draw_frame = draw_frame
+        self.window = draw_frame.window
 
     async def navigation_update(self, navigation_input: NavigationInput) -> None:
         """Is called on the active element when navigation input is received."""
@@ -508,7 +534,7 @@ class TUIElement:
         """Execute any actions that the object needs to perform"""
         pass
 
-    async def draw(self, draw_frame: DrawFrame) -> None:
+    async def draw(self) -> None:
         """Draw the object to the screen"""
         raise NotImplementedError("`TUIElement`s must implement a draw method")
 
@@ -565,10 +591,16 @@ class TUIElement:
         return self._focusable_children
 
     def is_focused(self) -> bool:
-        return self in _focused_elements
+        if self.window is None:
+            return False
+        return (
+            self in self.window._focused_elements
+        )  # TODO: avoid accessing the private members of TUIWindow
 
     def is_active(self) -> bool:
-        return self is _active_element
+        if self.window is None:
+            return False
+        return self is self.window._active_element
 
     def focus_next(self) -> None:
         if self.is_focusable and self.children is not None:
@@ -623,6 +655,7 @@ class TUIElement:
             self.parent.focus_prev()
 
     def focus(self) -> None:
+        # TODO: fix this so that Window is in charge of its private members
         if not self.is_focusable:
             if self.parent is not None:
                 self.parent.focus_next()
@@ -632,20 +665,22 @@ class TUIElement:
                 if child.is_focusable:
                     return child.focus()
 
-        _focused_elements.clear()
+        self.window._focused_elements.clear()
         parent = self.parent
         while parent is not None:
-            if parent in _focused_elements:
+            if parent in self.window._focused_elements:
                 break
-            _focused_elements.append(parent)
+            self.window._focused_elements.append(parent)
             parent = parent.parent
 
-        global _active_element
-        _active_element = self
-        _focused_elements.append(self)
+        self.window._active_element = self
+        self.window._focused_elements.append(self)
 
     def __setattr__(self, name: str, value: Any) -> None:
         super().__setattr__(name, value)
+        # TODO: this is kind of janky. Seems like there should be a nicer way...
+        if self.draw_frame.window is not None:
+            self.draw_frame.window._needs_redraw = True
         if name == "draw_frame":
             if not self.draw_frame.is_drawable:
                 self._is_focusable = False
@@ -1057,7 +1092,7 @@ class Button(TUIElement):
         if self.parent is not None:
             await self.parent.navigation_update(navigation_input)
 
-    async def draw(self, draw_frame: DrawFrame) -> None:
+    async def draw(self) -> None:
         if not self.draw_frame.is_drawable:
             return
 
@@ -1146,98 +1181,109 @@ class Button(TUIElement):
         return f"Button(label={repr(self.label)})"
 
 
+class tui_session:
+    _screen: "curses._CursesWindow"
+    _prev_env_term: str
+
+    def __init__(self) -> None:
+        pass
+
+    def __enter__(self) -> "curses._CursesWindow":
+        self._prev_env_term = environ["TERM"]
+        # TODO: Check if we are in a terminal that supports the XTERM API
+        # before doing this
+        environ["TERM"] = "xterm-1003"
+        self._screen = curses.initscr()
+
+        # STYLING (FUCK ME)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(0, curses.COLOR_WHITE, curses.COLOR_BLACK)
+        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
+        curses.init_pair(2, curses.COLOR_BLUE, curses.COLOR_BLACK)
+
+        # Mouse and interactivity settings
+        self._screen.keypad(1)
+        self._screen.nodelay(1)
+        curses.curs_set(0)
+        curses.raw()
+        curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        curses.mouseinterval(5)
+        print("\033[?1003h")  # enable mouse tracking with the XTERM API
+        # https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-Mouse-Tracking
+        curses.flushinp()
+        curses.noecho()
+        self._screen.clear()
+        return self._screen
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        environ["TERM"] = self._prev_env_term
+        curses.endwin()
+        curses.flushinp()
+        print("\033[?1003l", end="")  # disable mouse tracking with the XTERM API
+
+
 # TODO: figure out how to have something scrollable...
 # The issue is that the scrollable item needs to know how big it is, based on its internals...
 # the problem for us is that we have designed everything with a top down control scheme
 
 if __name__ == "__main__":
-    import asyncio
+    from autograder.logging.tui.clipboard import CopyableObject
+    from autograder.logging.tui.text import DataValue, Text
 
-    # Set environment variables
-    from os import environ
+    with tui_session() as screen:
+        button_one = Button(None, "One")
+        button_one.bound_function = button_one.select
 
-    # TODO: be a nice citizen and save the old TERM value and restore it later
-    # TODO: Also, check if we are in a terminal that supports the XTERM API
-    # before doing this
-    environ["TERM"] = "xterm-1003"
+        bottom_button_stack = Stack(
+            [
+                button_one,
+                Button(None, "Two"),
+                Button(None, "Three"),
+                Button(None, "Four"),
+                Button(None, "Five"),
+                Button(None, "Six"),
+                Button(None, "Seven"),
+                Button(None, "Eight"),
+                Button(None, "Nine"),
+                Button(None, "Ten"),
+            ],
+            Orientation.HORIZONTAL,
+            element_padding=1,
+            divider="│",
+        )
 
-    import curses
+        button_four = Button(None, "Button Four")
 
-    screen = curses.initscr()
+        text_block = Text(
+            "Here is some text¶ that we would like to have wrap very nicely and not exceed our cute little text box area.\nAnd the text, just does not stop. Just goes on and on and on, and there might even be some tremendously exceptionally long words occassionally",
+            new_line_character_style=curses.color_pair(0) | curses.A_DIM,
+        )
+        value_example = DataValue("Active Log", "generate_sums")
+        copyable_text_block = CopyableObject(
+            object=text_block, text_to_copy=text_block.text
+        )
+        content_stack = Stack(
+            [copyable_text_block, value_example],
+            orientation=Orientation.VERTICAL,
+        )
+        button_panel = Panel(
+            content_stack,
+            footer=bottom_button_stack,
+            header=button_four,
+        )
+        other_text_block = Text(
+            "This is some other text that will reside on the right side of the screen. sodfimeslietnsleijtlsidflsiefjseflseijflsiejf sljsielfjsliefjlsiejflsijelfijsliejflsijeflisjelf sleifjlsiejflisjelfijslfdlskvnlsd"
+        )
+        other_text_block_panel = Panel(
+            other_text_block, footer=Button(None, "A button")
+        )
 
-    # STYLING (FUCK ME)
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(0, curses.COLOR_WHITE, curses.COLOR_BLACK)
-    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
-    curses.init_pair(2, curses.COLOR_BLUE, curses.COLOR_BLACK)
+        side_by_side = Stack(
+            [button_panel, other_text_block_panel],
+            splits=[None, 35],
+            orientation=Orientation.HORIZONTAL,
+        )
+        window = TUIWindow(screen, side_by_side)
 
-    button_one = Button(None, "One")
-    button_one.bound_function = button_one.select
-
-    bottom_button_stack = Stack(
-        [
-            button_one,
-            Button(None, "Two"),
-            Button(None, "Three"),
-            Button(None, "Four"),
-            Button(None, "Five"),
-            Button(None, "Six"),
-            Button(None, "Seven"),
-            Button(None, "Eight"),
-            Button(None, "Nine"),
-            Button(None, "Ten"),
-        ],
-        Orientation.HORIZONTAL,
-        element_padding=1,
-        divider="│",
-    )
-
-    button_four = Button(None, "Button Four")
-
-    text_block = Text(
-        "Here is some text¶ that we would like to have wrap very nicely and not exceed our cute little text box area.\nAnd the text, just does not stop. Just goes on and on and on, and there might even be some tremendously exceptionally long words occassionally",
-        new_line_character_style=curses.color_pair(0) | curses.A_DIM,
-    )
-    value_example = DataValue("Active Log", "generate_sums")
-    copyable_text_block = CopyableObject(
-        object=text_block, text_to_copy=text_block.text
-    )
-    content_stack = Stack(
-        [copyable_text_block, value_example],
-        orientation=Orientation.VERTICAL,
-    )
-    button_panel = Panel(
-        content_stack,
-        footer=bottom_button_stack,
-        header=button_four,
-    )
-    other_text_block = Text(
-        "This is some other text that will reside on the right side of the screen. sodfimeslietnsleijtlsidflsiefjseflseijflsiejf sljsielfjsliefjlsiejflsijelfijsliejflsijeflisjelf sleifjlsiejflisjelfijslfdlskvnlsd"
-    )
-    other_text_block_panel = Panel(other_text_block, footer=Button(None, "A button"))
-
-    window = Stack(
-        [button_panel, other_text_block_panel],
-        splits=[None, 35],
-        orientation=Orientation.HORIZONTAL,
-    )
-
-    screen.keypad(1)
-    screen.nodelay(1)
-
-    curses.curs_set(0)
-    curses.raw()
-    curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
-    curses.mouseinterval(5)
-    print("\033[?1003h")  # enable mouse tracking with the XTERM API
-    # https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-Mouse-Tracking
-    curses.flushinp()
-    curses.noecho()
-    screen.clear()
-
-    asyncio.run(main())
-
-    curses.endwin()
-    curses.flushinp()
-    print("\033[?1003l")  # disable mouse tracking with the XTERM API
+        asyncio.run(window.run_window())
