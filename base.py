@@ -116,7 +116,7 @@ class TUIWindow:
         new_bounds = (
             ScreenCoord(
                 self._screen_padding[3],
-                self._screen_padding[0],
+                self._screen_padding[0] + 4,
             ),
             ScreenCoord(
                 self.screen_width - self._screen_padding[1] - 1,
@@ -126,6 +126,7 @@ class TUIWindow:
         self.bounds = new_bounds
         top_level_draw_frame = DrawFrame(self, bounds=self.bounds)
         await self.top_level_element.frame(top_level_draw_frame)
+        self._needs_redraw = True
 
     async def run_window(self) -> None:
         await self.frame()
@@ -507,14 +508,11 @@ class TUIElement:
     # - Internal logic in update
     # - Reframing
 
-    # Maybe all of the draws should be defered, so that we don't have logic
-    # issues with updates
-
     # TODO: maybe frame should say how big it is?
     async def frame(self, draw_frame: DrawFrame) -> None:
         """Sets the location for the object to be drawn in the view"""
         self.draw_frame = draw_frame
-        self.window = draw_frame.window
+        self.window = draw_frame.window  # TODO: is this necessary?
 
     async def navigation_update(self, navigation_input: NavigationInput) -> None:
         """Is called on the active element when navigation input is received."""
@@ -679,7 +677,7 @@ class TUIElement:
     def __setattr__(self, name: str, value: Any) -> None:
         super().__setattr__(name, value)
         # TODO: this is kind of janky. Seems like there should be a nicer way...
-        if self.draw_frame.window is not None:
+        if self.draw_frame.window is not None and not getattr(self, name) == value:
             self.draw_frame.window._needs_redraw = True
         if name == "draw_frame":
             if not self.draw_frame.is_drawable:
@@ -1218,9 +1216,9 @@ class tui_session:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         environ["TERM"] = self._prev_env_term
+        print("\033[?1003l", end="")  # disable mouse tracking with the XTERM API
         curses.endwin()
         curses.flushinp()
-        print("\033[?1003l", end="")  # disable mouse tracking with the XTERM API
 
 
 # TODO: figure out how to have something scrollable...
@@ -1284,6 +1282,6 @@ if __name__ == "__main__":
             splits=[None, 35],
             orientation=Orientation.HORIZONTAL,
         )
-        window = TUIWindow(screen, side_by_side)
+        window = TUIWindow(screen, other_text_block)
 
         asyncio.run(window.run_window())
