@@ -14,7 +14,7 @@ D. Eppstein, August 2005. (modified by Tanner Sims Jul 2024)
 import pyphen
 from typing import Callable, List
 
-from autograder.logging.tui.utils.smawk import OnlineConcaveMinima
+from tuiform.utils.smawk import OnlineConcaveMinima
 
 
 dic = pyphen.Pyphen(lang="en")

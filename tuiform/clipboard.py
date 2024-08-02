@@ -2,9 +2,9 @@ import time
 import curses
 import clipman
 
-from autograder.logging.tui.base import TUIElement, DrawFrame
-from autograder.logging.tui.screen import ScreenCoord
-from autograder.logging.tui.enums import NavigationInput
+from tuiform.element import TUIElement, DrawFrame
+from tuiform.screen import ScreenCoord
+from tuiform.enums import NavigationInput
 
 CLIPBOARD_AVAILABLE = False
 

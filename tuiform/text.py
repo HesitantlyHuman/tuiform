@@ -2,9 +2,9 @@ from typing import Tuple, List
 
 import curses
 
-from autograder.logging.tui.enums import Orientation
-from autograder.logging.tui.base import TUIElement, DrawFrame
-from autograder.logging.tui.utils.wrap import (
+from tuiform.enums import Orientation
+from tuiform.element import TUIElement, DrawFrame
+from tuiform.utils.wrap import (
     smart_wrap_text,
     right_pad_line,
     cut_line_with_ellipse,
