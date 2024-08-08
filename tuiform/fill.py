@@ -1,4 +1,6 @@
+from typing import Tuple, Optional
 from tuiform.element import TUIElement
+
 
 class Fill(TUIElement):
     fill_char: str
@@ -8,6 +10,17 @@ class Fill(TUIElement):
         super().__init__()
         self.fill_char = fill_char
         self.style = style
+
+    def get_size(
+        self, width_constraint: int | None = None, height_constraint: int | None = None
+    ) -> Tuple[int, int]:
+        if width_constraint is None:
+            width_constraint = 1
+
+        if height_constraint is None:
+            height_constraint = 1
+
+        return min(1, width_constraint), min(1, height_constraint)
 
     async def draw(self) -> None:
         for y in range(self.draw_frame.height):

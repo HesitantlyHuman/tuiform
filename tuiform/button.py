@@ -1,9 +1,10 @@
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, Tuple
 
 import curses
 
 from tuiform.enums import NavigationInput
 from tuiform.element import TUIElement
+
 
 # TODO: Only handles single-line text, replace text here with the text wrap stuff
 class Button(TUIElement):
@@ -20,7 +21,9 @@ class Button(TUIElement):
     ):
         super().__init__()
         if "\n" in label:
-            raise ValueError("`Button` does not support multiline labels.")
+            raise ValueError(
+                "`Button` does not support multiline labels."
+            )  # TODO: change this
         self.hover = False
         self.clicked = False
         self.label = label
@@ -37,6 +40,11 @@ class Button(TUIElement):
 
         if self.parent is not None:
             await self.parent.navigation_update(navigation_input)
+
+    def get_size(
+        self, width_constraint: int | None = None, height_constraint: int | None = None
+    ) -> Tuple[int, int]:
+        return super().get_size(width_constraint, height_constraint)
 
     async def draw(self) -> None:
         if not self.draw_frame.is_drawable:
@@ -101,19 +109,20 @@ class Button(TUIElement):
     ) -> None:
         if not self.draw_frame.is_drawable:
             return
-        if event_code == curses.KEY_MOUSE:
+        if event_code == curses.KEY_MOUSE and self.draw_frame.contains(
+            mouse_x, mouse_y
+        ):
             # Check if the mouse is within the bounds of the button
-            if self.draw_frame.contains(mouse_x, mouse_y):
-                self.hover = True
-                if mouse_button in [
-                    curses.BUTTON1_PRESSED,
-                    curses.BUTTON1_CLICKED,
-                    curses.BUTTON1_RELEASED,
-                ]:
-                    self.clicked = True
-                    self.focus()
-            else:
-                self.hover = False
+            self.hover = True
+            if mouse_button in [
+                curses.BUTTON1_PRESSED,
+                curses.BUTTON1_CLICKED,
+                curses.BUTTON1_RELEASED,
+            ]:
+                self.clicked = True
+                self.focus()
+        else:
+            self.hover = False
 
     async def execute(self) -> None:
         if self.clicked:

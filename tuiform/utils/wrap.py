@@ -47,7 +47,7 @@ def smart_wrap_text(
     widow_penalty: int = 30,  # penalize really short last line
     hyphen_breaking_penalty: int = 20,
     soft_hyphen_breaking_penalty: int = 40,
-    non_hyphen_breaking_penalty: int = 100,
+    non_hyphen_breaking_penalty: int = 110,
 ) -> List[str]:  # penalize breaking hyphenated words
     """Wrap the given text, returning a sequence of lines and minimizing raggedness.
 

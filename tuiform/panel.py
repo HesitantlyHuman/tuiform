@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import curses
 
@@ -6,6 +6,9 @@ from tuiform.enums import NavigationInput
 from tuiform.screen import ScreenCoord
 from tuiform.element import TUIElement, DrawFrame
 
+
+# TODO: Footer and header separators dissapear when panel is 4 wide
+# TODO: allow panel footer and header height to be set by the footer and header elements, optionally
 class Panel(TUIElement):
     content: TUIElement
     header: Optional[TUIElement]
@@ -40,6 +43,43 @@ class Panel(TUIElement):
         self.add_child(self.content)
         if self.footer is not None:
             self.add_child(self.footer)
+
+    def get_size(
+        self, width_constraint: int | None = None, height_constraint: int | None = None
+    ) -> Tuple[int, int]:
+        if width_constraint is not None:
+            width_constraint = width_constraint - 2
+
+        width, height = 0, 0
+        if height_constraint is not None:
+            height_constraint = height_constraint - 2
+            if self.footer is not None:
+                height_constraint = height_constraint - 2
+            if self.header is not None:
+                height_constraint = height_constraint - 2
+
+        if self.footer is not None:
+            footer_width, _ = self.footer.get_size(
+                width_constraint=width_constraint, height_constraint=1
+            )
+            width = max(width, footer_width)
+            height += 2
+
+        if self.header is not None:
+            header_width, _ = self.header.get_size(
+                width_constraint=width_constraint, height_constraint=1
+            )
+            width = max(width, header_width)
+            height += 2
+
+        content_width, content_height = self.content.get_size(
+            width_constraint=width_constraint, height_constraint=height_constraint
+        )
+        width = max(width, content_width)
+        height += content_height + 2
+        width += 2
+
+        return width, height
 
     async def frame(self, draw_frame: DrawFrame) -> None:
         self.draw_frame = draw_frame
@@ -106,6 +146,17 @@ class Panel(TUIElement):
             if self.parent is not None:
                 await self.parent.navigation_update(navigation_input)
             return
+
+        with open("logging.txt", "a") as f:
+            print(
+                f"Panel received navigation input {navigation_input}",
+                file=f,
+            )
+            print(
+                f"{self.focusable_children}",
+                file=f,
+            )
+            print(f"{[c.is_focused() for c in self.focusable_children]}", file=f)
 
         # TODO: figure out a better way for the TUIElements to query
         # their focusable children
@@ -204,4 +255,3 @@ class Panel(TUIElement):
 
     def __repr__(self) -> str:
         return f"Panel(content={self.content}, header={self.header}, footer={self.footer}, horizontal_padding={self.horizontal_padding}, vertical_padding={self.vertical_padding})"
-

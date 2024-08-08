@@ -12,24 +12,25 @@ from tuiform.utils.wrap import (
 
 
 class Text(TUIElement):
+    text: str
+    text_style: int
+    new_line_character_style: int
+
     def __init__(
         self, text: str, text_style: int = 0, new_line_character_style: int = 0
     ) -> None:
         super().__init__()
         self.text = text
-        self.lines: List[str] = []
-        self.new_line_characters: List[Tuple[int, int]] = []
         self.text_style = text_style
         self.new_line_character_style = new_line_character_style
 
-    async def frame(self, draw_frame: DrawFrame) -> None:
-        self.draw_frame = draw_frame
+        self._cached_lines: List[str] = []
+        self._formatted_lines: List[str] = []
+        self._cached_width: int = None
+        self._new_line_locations: List[Tuple[int, int]] = []
 
-        if not self.draw_frame.is_drawable:
-            return
-
-        if self.draw_frame.height <= 0 or self.draw_frame.width <= 0:
-            return
+    def split_text(self, width: int):
+        self._cached_width = width
 
         # We are using a unicode character in the private use section so that
         # if there are line break characters already in the text we do not
@@ -41,39 +42,62 @@ class Text(TUIElement):
         ]
         wrapped_lines: List[str] = []
         for line in real_lines:
-            wrapped_lines.extend(
-                smart_wrap_text(line, target_width=self.draw_frame.width)
-            )
+            wrapped_lines.extend(smart_wrap_text(line, target_width=width))
 
         # Now, we need to find our newline characters and take them out because
         # we want to format them differently, also pad or truncate the lines
-        formatted_lines: List[str] = []
+        cleaned_lines: List[str] = []
         new_line_locations: List[Tuple[int, int]] = []
         for line_number, line in enumerate(wrapped_lines):
-            if len(line) > self.draw_frame.width:
-                line = cut_line_with_ellipse(line, self.draw_frame.width)
+            if len(line) > width:
+                line = cut_line_with_ellipse(line, width)
             for character_number, character in enumerate(line):
                 if character == "\uf026":
                     new_line_locations.append((character_number, line_number))
             line = line.replace("\uf026", "¶")
-            line = right_pad_line(line, self.draw_frame.width)
-            formatted_lines.append(line)
+            line = right_pad_line(line, width)
+            cleaned_lines.append(line)
 
+        self._cached_lines = cleaned_lines
+        self._new_line_locations = new_line_locations
+
+    def get_size(
+        self, width_constraint: int | None = None, height_constraint: int | None = None
+    ) -> Tuple[int]:
+        if width_constraint is None:
+            width_constraint = len(self.text)
+
+        if not width_constraint == self._cached_width:
+            self.split_text(width_constraint)
+
+        if height_constraint is None:
+            height_constraint = len(self._cached_lines)
+
+        return width_constraint, min(len(self._cached_lines), height_constraint)
+
+    async def frame(self, draw_frame: DrawFrame) -> None:
+        self.draw_frame = draw_frame
+        if not self.draw_frame.is_drawable:
+            return
+
+        if not self.draw_frame.width == self._cached_width:
+            self.split_text(self.draw_frame.width)
+
+        formatted_lines = self._cached_lines.copy()
         if len(formatted_lines) > self.draw_frame.height:
             formatted_lines = formatted_lines[: self.draw_frame.height]
             last_line = cut_line_with_ellipse(
                 formatted_lines[-1], self.draw_frame.width
             )
             formatted_lines[-1] = last_line
+        self._formatted_lines = formatted_lines
 
-        self.lines = formatted_lines
-        self.new_line_characters = new_line_locations
-
+    # TODO: also draw the ellipses
     async def draw(self) -> None:
-        for line_idx, line in enumerate(self.lines):
+        for line_idx, line in enumerate(self._formatted_lines):
             self.draw_frame.draw(0, line_idx, line, self.text_style)
 
-        for x, y in self.new_line_characters:
+        for x, y in self._new_line_locations:
             self.draw_frame.draw(x, y, "¶", self.new_line_character_style)
 
     def __repr__(self) -> str:
@@ -96,14 +120,29 @@ class DataValue(TUIElement):
             text=self.value, text_style=curses.color_pair(2) | curses.A_BOLD
         )
 
+    def get_size(
+        self, width_constraint: int | None = None, height_constraint: int | None = None
+    ) -> Tuple[int]:
+        label_width, _ = self.label_text_box.get_size(
+            width_constraint=width_constraint, height_constraint=1
+        )
+        value_width, _ = self.value_text_box.get_size(
+            width_constraint=width_constraint, height_constraint=1
+        )
+        width = label_width + value_width + 1
+        if width_constraint is not None:
+            width = min(width_constraint, width)
+
+        return width, 1
+
     async def frame(self, draw_frame: DrawFrame) -> None:
+        self.draw_frame = draw_frame
         if not draw_frame.is_drawable:
             return
 
-        self.draw_frame = draw_frame
-        # TODO: how should we handle it when there is not enough space even for the label?
+        label_width = min(len(self.label) + 1, self.draw_frame.width)
         frames = draw_frame.split(
-            [len(self.label) + 1, None], orientation=Orientation.HORIZONTAL
+            [label_width, None], orientation=Orientation.HORIZONTAL
         )
         await self.label_text_box.frame(frames[0])
         await self.value_text_box.frame(frames[1])

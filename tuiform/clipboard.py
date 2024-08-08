@@ -1,5 +1,6 @@
 import time
 import curses
+from typing import Tuple
 import clipman
 
 from tuiform.element import TUIElement, DrawFrame
@@ -28,13 +29,13 @@ class CopyableObject(TUIElement):
 
     def __init__(
         self,
-        object: TUIElement,
+        content: TUIElement,
         text_to_copy: str,
         copy_button_style: int = 0,
         copy_button_highlight_style: int = None,
     ):
         super().__init__()
-        self.object = object
+        self.content = content
         self.text_to_copy = text_to_copy
         self.copy_button_style = copy_button_style
         if copy_button_highlight_style is None:
@@ -45,10 +46,23 @@ class CopyableObject(TUIElement):
         self.copied = False
         self.copied_timestamp = 0
 
+    def get_size(
+        self, width_constraint: int | None = None, height_constraint: int | None = None
+    ) -> Tuple[int, int]:
+        if width_constraint is not None:
+            width_constraint = width_constraint - 2
+
+        content_width, content_height = self.content.get_size(
+            width_constraint=width_constraint, height_constraint=height_constraint
+        )
+
+        return content_width + 2, content_height
+
     async def frame(self, draw_frame: DrawFrame) -> None:
         self.draw_frame = draw_frame
         if not self.draw_frame.is_drawable:
             return
+
         # We need to reserve the far right column for the copy button
         wrapped_object_frame = draw_frame.subframe(
             (
@@ -56,7 +70,7 @@ class CopyableObject(TUIElement):
                 ScreenCoord(draw_frame.width - 3, draw_frame.height - 1),
             )
         )
-        await self.object.frame(wrapped_object_frame)
+        await self.content.frame(wrapped_object_frame)
 
     async def navigation_update(self, navigation_input: NavigationInput) -> None:
         if navigation_input is NavigationInput.NONE:
@@ -70,13 +84,14 @@ class CopyableObject(TUIElement):
             await self.parent.navigation_update(navigation_input)
 
     async def draw(self) -> None:
+        if not self.draw_frame.is_drawable:
+            return
+
         if self.hovered or self.is_active():
             style = self.copy_button_highlight_style
         else:
             style = self.copy_button_style
 
-        if not self.draw_frame.is_drawable:
-            return
         self.draw_frame.draw(
             self.draw_frame.width - 1,
             0,
@@ -87,15 +102,14 @@ class CopyableObject(TUIElement):
         if time.time() < self.copied_timestamp + CopyableObject.MESSAGE_DISPLAY_TIME:
             # TODO: query the size of the screen so that we can push this overlay
             # message around to always show up
-            # TODO: maybe create a late_draw method which is called after the normal
-            # draw, so that we can ensure overlays function correctly
-            # (How do we figure out if that is too much overhead?)
+            # TODO: Give the messages borders
             if CLIPBOARD_AVAILABLE:
                 self.draw_frame.draw(
-                    self.draw_frame.width - 21,
+                    self.draw_frame.width - 10,
                     -1,
                     "(Copied to clipboard)",
                     overlay=True,
+                    z=1,
                 )
             else:
                 self.draw_frame.draw(
@@ -103,9 +117,10 @@ class CopyableObject(TUIElement):
                     -1,
                     "(Install `xsel` or `xclip` if you want to be able to copy to your clipboard)",
                     overlay=True,
+                    z=1,
                 )
 
-        await self.object.draw()
+        await self.content.draw()
 
     async def update(
         self, event_code: int, mouse_x: int, mouse_y: int, mouse_button: int
@@ -133,7 +148,7 @@ class CopyableObject(TUIElement):
             else:
                 self.hovered = False
 
-        await self.object.update(
+        await self.content.update(
             event_code=event_code,
             mouse_x=mouse_x,
             mouse_y=mouse_y,
@@ -146,7 +161,7 @@ class CopyableObject(TUIElement):
             self.copied_timestamp = time.time()
             if CLIPBOARD_AVAILABLE:
                 clipman.set(self.text_to_copy)
-        await self.object.execute()
+        await self.content.execute()
 
     def __repr__(self) -> str:
-        return f"CopyableText(object={self.object}, text_to_copy={repr(self.text_to_copy)}, copy_button_style={self.copy_button_style})"
+        return f"CopyableText(content={self.content}, text_to_copy={repr(self.text_to_copy)}, copy_button_style={self.copy_button_style})"

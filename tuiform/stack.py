@@ -1,8 +1,10 @@
-from typing import List
+from typing import List, Tuple, Optional
 
+from tuiform.utils.split import split_int
 from tuiform.fill import Fill
 from tuiform.enums import NavigationInput, Orientation
 from tuiform.element import TUIElement, DrawFrame
+
 
 class Stack(TUIElement):
     orientation: Orientation
@@ -59,6 +61,37 @@ class Stack(TUIElement):
         for element in elements:
             self.add_child(element)
 
+    def get_size(
+        self, width_constraint: int | None = None, height_constraint: int | None = None
+    ) -> Tuple[int, int]:
+        if height_constraint is not None and self.orientation is Orientation.VERTICAL:
+            child_height_constraints = split_int(height_constraint, self.splits)
+        elif height_constraint is not None:
+            child_height_constraints = [height_constraint for _ in self.splits]
+        else:
+            child_height_constraints = [None for _ in self.splits]
+
+        if width_constraint is not None and self.orientation is Orientation.HORIZONTAL:
+            child_width_constraints = split_int(width_constraint, self.splits)
+        elif width_constraint is not None:
+            child_width_constraints = [width_constraint for _ in self.splits]
+        else:
+            child_width_constraints = [None for _ in self.splits]
+
+        width, height = 0, 0
+        for i, child in enumerate(self.children):
+            child_width, child_height = child.get_size(
+                width_constraint=child_width_constraints[i],
+                height_constraint=child_height_constraints[i],
+            )
+            if self.orientation == Orientation.VERTICAL:
+                width = max(width, child_width)
+                height += child_height
+            else:
+                width += child_width
+                height = max(height, child_height)
+        return width, height
+
     async def frame(self, draw_frame: DrawFrame) -> None:
         self.draw_frame = draw_frame
         subframes = self.draw_frame.split(self.splits, self.orientation)
@@ -74,7 +107,7 @@ class Stack(TUIElement):
                 await self.parent.navigation_update(navigation_input)
             return
 
-        with open("output.txt", "a") as f:
+        with open("logging.txt", "a") as f:
             print(
                 f"Stack with orientation {self.orientation} received navigation input {navigation_input}",
                 file=f,
@@ -85,13 +118,13 @@ class Stack(TUIElement):
                 Orientation.VERTICAL,
                 NavigationInput.DOWN,
             ):
-                with open("output.txt", "a") as f:
+                with open("logging.txt", "a") as f:
                     print(
                         f"Checking if focus next",
                         file=f,
                     )
                 if not self.focusable_children[-1].is_focused():
-                    with open("output.txt", "a") as f:
+                    with open("logging.txt", "a") as f:
                         print(
                             f"Focusing next",
                             file=f,
@@ -107,11 +140,11 @@ class Stack(TUIElement):
                     return
             case (_, NavigationInput.FIRST):
                 if not self.focusable_children[0].is_focused():
-                    self.focus(last=False)
+                    self.focus()
                     return
-            case (_, NavigationInput.LAST):
+            case (_, NavigationInput.LAST):  # TODO: fix this
                 if not self.focusable_children[-1].is_focused():
-                    self.focus(last=True)
+                    self.focus()
                     return
             case (_, NavigationInput.NEXT):
                 if self.parent is not None:

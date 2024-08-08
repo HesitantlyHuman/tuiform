@@ -37,8 +37,8 @@ class TUIWindow:
         bounds: Tuple[ScreenCoord, ScreenCoord] = None,
         resize: bool = True,
     ) -> None:
-        self.screen = screen
         self.top_level_element = top_level_element
+        self.screen = screen
 
         self._pending_draws = []
         self._screen_size = None
@@ -75,16 +75,12 @@ class TUIWindow:
             for draw_call in draw_layer:
                 pos, text, style = draw_call
                 self.run_draw_call(pos.x, pos.y, text, style)
-        self.pending_draws = []
+        self._pending_draws = []
 
     def run_draw_call(self, x: int, y: int, text: str, style: int = None) -> None:
         # Curses will fail if we try to draw to the bottom right corner of the
         # screen, so we need to check if we are trying to do so, and just draw
         # that character seperate
-        with open("logging.txt", "a") as f:
-            print(f"Position: {x}, {y}\nContent: {repr(text)}\nStyle: {style}", file=f)
-            print(f"Screen Size: {self._screen_size}", file=f)
-            print(f"Width of text: {len(text)}", file=f)
         if x + len(text) >= self.screen_width and y >= self.screen_height - 1:
             if style is None:
                 try:
@@ -107,16 +103,17 @@ class TUIWindow:
 
     async def draw(self) -> None:
         if self._needs_redraw:
+            self.screen.erase()  # Do not use clear(), as it will cause flickering artifacts
             await self.top_level_element.draw()
-        self.run_draw_calls()
-        self._needs_redraw = False
+            self.run_draw_calls()
+            self._needs_redraw = False
 
     async def frame(self) -> None:
         self._screen_size = None
         new_bounds = (
             ScreenCoord(
                 self._screen_padding[3],
-                self._screen_padding[0] + 4,
+                self._screen_padding[0] + 2,
             ),
             ScreenCoord(
                 self.screen_width - self._screen_padding[1] - 1,
@@ -128,13 +125,12 @@ class TUIWindow:
         await self.top_level_element.frame(top_level_draw_frame)
         self._needs_redraw = True
 
-    async def run_window(self) -> None:
+    async def start(self) -> None:
         await self.frame()
         self.top_level_element.focus()
         while True:
             key = await await_getch(self.screen)
-            self.screen.erase()  # Do not use clear(), as it will cause flickering artifacts
-            self.screen.addstr(f"Key: {key}")
+            self.screen.addstr(0, 0, f"Key: {key}")
 
             mouse_x, mouse_y, mouse_button = None, None, None
             if key == curses.KEY_RESIZE:
@@ -151,9 +147,13 @@ class TUIWindow:
 
             await self.top_level_element.update(key, mouse_x, mouse_y, mouse_button)
             if not self._active_element is None:
+                # TODO: this is also very janky
+                prev_active_element = self._active_element
                 await self._active_element.navigation_update(
                     NavigationInput.from_key_code(key)
                 )
+                if not self._active_element is prev_active_element:
+                    self._needs_redraw = True
             await self.top_level_element.execute()
             await self.draw()
 
@@ -186,9 +186,20 @@ class TUIWindow:
         return (self.bounds[1].y - self.bounds[0].y) + 1
 
 
+# # TODO: How do we make the distinction clear here? Because this does not handle any of the drawing or focusing that the real one does. Maybe we call it a pane or something different?
+# # Maybe these are the real draw frames, and the others are just screen regions?
+# class VirtualTUIWindow:
+#     window: TUIWindow | "VirtualTUIWindow"
+#     bounds: Tuple
+
+
+# TODO: replace the split with the new util function
+# TODO: see, we can do the scrolling draw frame like this, and for the most part that is fine
+# The issue is that the height is never going to be the scroll content height, which is an issue for framing
 class DrawFrame:
     window: TUIWindow
     bounds: Optional[Tuple[ScreenCoord, ScreenCoord]]
+    offset: Optional[Tuple[int, int]]
 
     _has_drawn: bool = False
 
@@ -196,6 +207,7 @@ class DrawFrame:
         self,
         window: TUIWindow,
         bounds: Optional[Tuple[ScreenCoord, ScreenCoord]] = None,
+        offset: Optional[Tuple[int, int]] = None,
     ):
         self.window = window
         if bounds is not None:
@@ -209,6 +221,7 @@ class DrawFrame:
             ):
                 bounds = None
         self.bounds = bounds
+        self.offset = offset
 
     def draw(
         self,
@@ -246,12 +259,16 @@ class DrawFrame:
         adjusted_x = x + self.bounds[0].x
         adjusted_y = y + self.bounds[0].y
 
+        if self.offset is not None:
+            adjusted_x += self.offset[0]
+            adjusted_y += self.offset[1]
+
         if not overlay and (
             adjusted_x > self.bounds[1].x or adjusted_y > self.bounds[1].y
         ):
             return
 
-        if adjusted_y > self.window.height:
+        if adjusted_y > self.window.height + self.window.bounds[0].y:
             return
 
         # Now, lets trim the text to fit within the bounds
@@ -266,7 +283,7 @@ class DrawFrame:
             ]
 
         self.window.schedule_draw(
-            ScreenCoord(x, y), text, style, z
+            ScreenCoord(adjusted_x, adjusted_y), text, style, z
         )  # TODO: figure out if we want to make everything use screen cords.
 
     def pad(self, horizontal: int, vertical: int) -> "DrawFrame":
@@ -332,9 +349,9 @@ class DrawFrame:
         """
         if self.bounds is None:
             if isinstance(splits, int):
-                return [DrawFrame(self.screen) for _ in range(splits)]
+                return [DrawFrame(self.window) for _ in range(splits)]
             elif isinstance(splits, Sequence):
-                return [DrawFrame(self.screen) for _ in splits]
+                return [DrawFrame(self.window) for _ in splits]
             else:
                 raise ValueError(
                     f"`DrawFrame.split` expected `splits` type of int or sequence, received type of {type(splits)} instead."
@@ -483,14 +500,16 @@ class DrawFrame:
 
     @property
     def is_drawable(self) -> bool:
-        return self.bounds is not None
+        return self.bounds is not None and self.window is not None
 
     def __repr__(self) -> str:
         return f"DrawFrame(screen={self.screen}, bounds={self.bounds})"
 
 
 class TUIElement:
-    IS_INTERACTABLE: bool = False
+    IS_INTERACTABLE: bool = (
+        False  # TODO: maybe interactability can be done by checking the update and navigation update functions
+    )
 
     draw_frame: DrawFrame
     window: TUIWindow
@@ -509,7 +528,13 @@ class TUIElement:
     # - Internal logic in update
     # - Reframing
 
-    # TODO: maybe frame should say how big it is?
+    # TODO: frame and draw probably don't need to be async
+
+    def get_size(
+        self, width_constraint: int | None = None, height_constraint: int | None = None
+    ) -> Tuple[int, int]:
+        raise NotImplementedError("")  # TODO: write this error
+
     async def frame(self, draw_frame: DrawFrame) -> None:
         """Sets the location for the object to be drawn in the view"""
         self.draw_frame = draw_frame
@@ -537,6 +562,10 @@ class TUIElement:
         """Draw the object to the screen"""
         raise NotImplementedError("`TUIElement`s must implement a draw method")
 
+    # TODO: change this to be automatic, so that implementers of TUIElement do
+    # not need to remember to do it. (Use the attribute assignment to check if we are adding
+    # a TUIElement as an attribute.)
+    # Wait... maybe not, the TUIElement in question could be a parent...
     def add_child(self, child: "TUIElement") -> None:
         if self.children is None:
             self.children = []
@@ -589,6 +618,7 @@ class TUIElement:
                     self._focusable_children.append(child)
         return self._focusable_children
 
+    # TODO: why is this not a property if other things are?
     def is_focused(self) -> bool:
         if self.window is None:
             return False
@@ -656,7 +686,7 @@ class TUIElement:
     def focus(self) -> None:
         if self.window is None:
             return
-        
+
         # TODO: fix this so that Window is in charge of its private members
         if not self.is_focusable:
             if self.parent is not None:
@@ -679,10 +709,14 @@ class TUIElement:
         self.window._focused_elements.append(self)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        super().__setattr__(name, value)
         # TODO: this is kind of janky. Seems like there should be a nicer way...
-        if self.draw_frame.window is not None and not getattr(self, name) == value:
+        if (
+            not name == "draw_frame"
+            and self.draw_frame.window is not None
+            and not getattr(self, name) == value
+        ):
             self.draw_frame.window._needs_redraw = True
+        super().__setattr__(name, value)
         if name == "draw_frame":
             if not self.draw_frame.is_drawable:
                 self._is_focusable = False
